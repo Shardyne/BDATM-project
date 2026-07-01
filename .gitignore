@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Large binary / embedding files
+*.npy
+*.pkl
+*.db
+*.db.lock
+
+# Milvus
+milvus.db
+*.milvus.db
+
+# Misc
+.DS_Store
+*.zip
+node_modules/
