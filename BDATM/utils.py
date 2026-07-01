@@ -362,7 +362,7 @@ def evaluate_retrieval(df, retrieval_configs, n_samples=100, random_states=[42, 
                     candidate_id_sets = [{int(c['id']) for c in cd['candidates']} for cd in concept_data]
 
                     query = row['sentence']
-                    if 'llm_model' in cfg:
+                    if 'llm_model' in cfg and 'retrieve_fn' not in cfg:
                         query = llm_simplify_query(
                             query,
                             model=cfg['llm_model'],
@@ -515,7 +515,7 @@ def plot_recall_at_k(df, retrieval_configs, k_values, n_samples=100, random_stat
                 gt_ids            = [int(cd['pictogram']['id']) for cd in row['concepts']]
                 candidate_id_sets = [{int(c['id']) for c in cd['candidates']} for cd in row['concepts']]
                 query = row['sentence']
-                if 'llm_model' in cfg:
+                if 'llm_model' in cfg and 'retrieve_fn' not in cfg:
                     query = llm_simplify_query(
                         query,
                         model=cfg['llm_model'],
