@@ -188,7 +188,7 @@ _SIMPLIFY_SYSTEM = (
 
 # function used to call the LLMs via either ollama or webllm (browser-based) 
 # backends to simplify a sentence into AAC keywords
-def llm_simplify_query(sentence, model='qwen3.5:4b', backend='ollama', bridge=None):
+def llm_simplify_query(sentence, model='qwen3.5:4b', backend='ollama', bridge=None, seed=42):
     """Simplify a sentence into AAC keywords using an LLM. Falls back to original on failure."""
     try:
         if backend == 'ollama':
@@ -200,7 +200,7 @@ def llm_simplify_query(sentence, model='qwen3.5:4b', backend='ollama', bridge=No
                     {"role": "user",   "content": f"/no_think\n{sentence}"},
                 ],
                 think=False,
-                options={"temperature": 0, "seed": 42},
+                options={"temperature": 0, "seed": seed},
             )
             raw = re.sub(r'<think>[\s\S]*?</think>\s*', '', resp.message.content).strip()
             return raw if raw else sentence
@@ -231,7 +231,7 @@ def extract_keywords_list(keywords):
         return []
     return [k['keyword'] for k in keywords if isinstance(k, dict) and 'keyword' in k]
 
-# create a classx
+# create a class to wrap the Jina embeddings model for text and image encoding
 class JinaEmbeddings:
     def __init__(self, model_name):
         import torch
@@ -262,7 +262,21 @@ class JinaEmbeddings:
 
     def embed_query(self, text):
         return self.model.encode_query([text], normalize_embeddings=True).tolist()[0]
+    
+# sets the random seed for reproducibility across random, numpy, torch, and transformers libraries
+def set_seed(seed=42):
+    import torch
+    from transformers import set_seed as hf_set_seed
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if torch.backends.mps.is_available():
+        torch.mps.manual_seed(seed)
+    hf_set_seed(seed)
 
+# a hit requires an exact gold pictogram match; recall, precision, and F1 are computed accordingly
 def strict_retrieval_metrics(gt_ids, retrieved_ids):
     """Strict: gold = one pictogram per concept. Hit if gold pictogram is retrieved."""
     ret_set  = {int(r) for r in retrieved_ids}
@@ -276,7 +290,7 @@ def strict_retrieval_metrics(gt_ids, retrieved_ids):
     f1 = 2*recall*precision/(recall+precision) if (recall+precision) > 0 else 0.0
     return {'recall': recall, 'precision': precision, 'f1': f1}
 
-
+# a hit requires any valid pictogram (gold or candidate) to be retrieved; recall, precision, and F1 are computed accordingly
 def relaxed_retrieval_metrics(gt_ids, retrieved_ids, candidate_id_sets):
     """Relaxed: gold = pictogram + all candidates per concept. Hit if any valid is retrieved."""
     ret_set = {int(r) for r in retrieved_ids}
@@ -293,6 +307,7 @@ def relaxed_retrieval_metrics(gt_ids, retrieved_ids, candidate_id_sets):
     f1 = 2*recall*precision/(recall+precision) if (recall+precision) > 0 else 0.0
     return {'recall': recall, 'precision': precision, 'f1': f1}
 
+# it embeds the query and then retrieves the top_k pictogram ids from Milvus using the provided client, collection, and embedding function
 def retrieve(query, top_k, client, collection, embed_fn):
     vec = embed_fn(query)
     results = client.search(
@@ -303,54 +318,83 @@ def retrieve(query, top_k, client, collection, embed_fn):
     )[0]
     return [r['entity']['id'] for r in results]
 
-def evaluate_retrieval(df, retrieval_configs, n_samples=100, random_states=[42, 10, 99], k=200, plot=False):
+# the function takes the dataframe of sentences and concepts, a dictionary of retrieval configurations,
+#  and evaluates the retrieval performance using strict and relaxed metrics. 
+# It samples a subset of sentences, retrieves pictograms for each sentence using the specified 
+# retrieval configurations, and computes recall, precision, and F1 scores. The results are aggregated 
+# across multiple random states, and confidence intervals are calculated. It supports a custom retrieval function for each configuration, 
+# allowing for flexibility in how the retrieval is performed. Optionally, it can plot the results.
+def evaluate_retrieval(df, retrieval_configs, n_samples=100, random_states=[42, 10, 99], k=200, plot=False, checkpoint_path=None):
+    import json as _json
     from scipy.stats import t as t_dist
+
+    _ckpt_done = {}
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        with open(checkpoint_path) as _f:
+            _ckpt_done = _json.load(_f)
+        print(f"Checkpoint loaded: {len(_ckpt_done)} entries done")
+
+    def _ckpt_save():
+        if checkpoint_path:
+            with open(checkpoint_path, 'w') as _f:
+                _json.dump(_ckpt_done, _f, indent=2)
+
     all_runs = []
 
     for random_state in random_states:
+        set_seed(random_state)
         print(f'\n{"="*60}')
         print(f'Random state: {random_state}')
         print(f'{"="*60}')
         sample = df.sample(n=min(n_samples, len(df)), random_state=random_state).reset_index(drop=True)
 
         for cfg in retrieval_configs:
-            records = []
-            pbar = tqdm(sample.iterrows(), total=len(sample), desc=cfg['name'], unit='sent')
-            for _, row in pbar:
-                concept_data      = row['concepts']
-                gt_ids            = [int(cd['pictogram']['id']) for cd in concept_data]
-                candidate_id_sets = [{int(c['id']) for c in cd['candidates']} for cd in concept_data]
+            _key = f"{random_state}__{cfg['name']}"
+            if _key in _ckpt_done:
+                print(f"  [checkpoint] skipping {cfg['name']} (seed={random_state})")
+                records = _ckpt_done[_key]
+            else:
+                records = []
+                pbar = tqdm(sample.iterrows(), total=len(sample), desc=cfg['name'], unit='sent')
+                for _, row in pbar:
+                    concept_data      = row['concepts']
+                    gt_ids            = [int(cd['pictogram']['id']) for cd in concept_data]
+                    candidate_id_sets = [{int(c['id']) for c in cd['candidates']} for cd in concept_data]
 
-                query = row['sentence']
-                if 'llm_model' in cfg:
-                    query = llm_simplify_query(
-                        query,
-                        model=cfg['llm_model'],
-                        backend=cfg.get('backend', 'ollama'),
-                        bridge=cfg.get('bridge'),
-                    )
-                    print(f"[llm_simplify] sentence={row['sentence']!r}  query={query!r}", flush=True)
+                    query = row['sentence']
+                    if 'llm_model' in cfg:
+                        query = llm_simplify_query(
+                            query,
+                            model=cfg['llm_model'],
+                            backend=cfg.get('backend', 'ollama'),
+                            bridge=cfg.get('bridge'),
+                            seed=random_state,
+                        )
+                        print(f"[llm_simplify] sentence={row['sentence']!r}  query={query!r}", flush=True)
 
-                if 'retrieve_fn' in cfg:
-                    retrieved = cfg['retrieve_fn'](query, top_k=k)
-                else:
-                    retrieved = retrieve(query, top_k=k,
-                                         client=cfg['client'],
-                                         collection=cfg['collection'],
-                                         embed_fn=cfg['embed_fn'])
+                    if 'retrieve_fn' in cfg:
+                        retrieved = cfg['retrieve_fn'](query, top_k=k)
+                    else:
+                        retrieved = retrieve(query, top_k=k,
+                                             client=cfg['client'],
+                                             collection=cfg['collection'],
+                                             embed_fn=cfg['embed_fn'])
 
-                strict  = strict_retrieval_metrics(gt_ids, retrieved)
-                relaxed = relaxed_retrieval_metrics(gt_ids, retrieved, candidate_id_sets)
-                records.append({
-                    'recall':            strict['recall'],
-                    'precision':         strict['precision'],
-                    'f1':                strict['f1'],
-                    'relaxed_recall':    relaxed['recall'],
-                    'relaxed_precision': relaxed['precision'],
-                    'relaxed_f1':        relaxed['f1'],
-                })
-                avg = pd.DataFrame(records).mean()
-                pbar.set_postfix(rec=f"{avg['recall']:.2f}", rel=f"{avg['relaxed_recall']:.2f}")
+                    strict  = strict_retrieval_metrics(gt_ids, retrieved)
+                    relaxed = relaxed_retrieval_metrics(gt_ids, retrieved, candidate_id_sets)
+                    records.append({
+                        'recall':            strict['recall'],
+                        'precision':         strict['precision'],
+                        'f1':                strict['f1'],
+                        'relaxed_recall':    relaxed['recall'],
+                        'relaxed_precision': relaxed['precision'],
+                        'relaxed_f1':        relaxed['f1'],
+                    })
+                    avg = pd.DataFrame(records).mean()
+                    pbar.set_postfix(rec=f"{avg['recall']:.2f}", rel=f"{avg['relaxed_recall']:.2f}")
+
+                _ckpt_done[_key] = records
+                _ckpt_save()
 
             rdf = pd.DataFrame(records)
             all_runs.append({
@@ -411,28 +455,16 @@ def evaluate_retrieval(df, retrieval_configs, n_samples=100, random_states=[42, 
 
     return runs_df, summary
 
-
-def set_seed(seed=42):
-    import torch
-    from transformers import set_seed as hf_set_seed
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    if torch.backends.mps.is_available():
-        torch.mps.manual_seed(seed)
-    hf_set_seed(seed)
-
-
-def make_llm_simplify_config(base_cfg, llm_model='qwen3.5:4b', backend='ollama', bridge=None, **kwargs):
+# wraps a retrieval config with LLM query simplification at retrieval time, where the LLM simplifies the user query 
+# into AAC keywords before embedding, improving retrieval quality for short/informal queries
+def make_llm_simplify_config(base_cfg, llm_model='qwen3.5:4b', backend='ollama', bridge=None, seed=42, **kwargs):
     """Wrap a retrieval config with LLM query simplification at retrieval time.
 
     The LLM strips noise from the user query into AAC keywords before embedding,
     improving retrieval quality for short/informal user queries.
     """
     def retrieve_fn(sentence, top_k):
-        simplified = llm_simplify_query(sentence, model=llm_model, backend=backend, bridge=bridge)
+        simplified = llm_simplify_query(sentence, model=llm_model, backend=backend, bridge=bridge, seed=seed)
         return retrieve(simplified, top_k=top_k,
                         client=base_cfg['client'], collection=base_cfg['collection'],
                         embed_fn=base_cfg['embed_fn'])
@@ -443,115 +475,70 @@ def make_llm_simplify_config(base_cfg, llm_model='qwen3.5:4b', backend='ollama',
         'llm_model':   llm_model,
         'backend':     backend,
         'bridge':      bridge,
+        'seed':        seed,
     }
 
-
-def make_llm_expand_config(base_cfg, llm_model='qwen3.5:4b', backend='ollama', concept_k=50):
-    """Wrap a retrieval config with LLM concept expansion.
-
-    Retrieves base_k = top_k // 2 candidates with the sentence, then calls the LLM
-    to extract concepts and retrieves concept_k candidates per concept using the same
-    collection. Returns up to top_k candidates from the union.
-    """
-    def retrieve_fn(sentence, top_k):
-        base = retrieve(sentence, top_k=top_k // 2,
-                        client=base_cfg['client'], collection=base_cfg['collection'],
-                        embed_fn=base_cfg['embed_fn'])
-        raw, _ = call_llm(sentence, model=llm_model, backend=backend)
-        concepts = _parse_llm_list(raw) or []
-        seen = set(base)
-        expanded = list(base)
-        for concept in concepts:
-            for pid in retrieve(concept, top_k=concept_k,
-                                client=base_cfg['client'], collection=base_cfg['collection'],
-                                embed_fn=base_cfg['embed_fn']):
-                if pid not in seen:
-                    expanded.append(pid)
-                    seen.add(pid)
-        return expanded[:top_k]
-
-    return {'name': f"{base_cfg['name']} + LLM", 'retrieve_fn': retrieve_fn}
-
-
-_HYDE_SYSTEM = (
-    "You are a pictogram description generator.\n"
-    "Given a user query, write a short visual description of what a relevant AAC pictogram would show.\n"
-    "Write it as a simple image caption using concrete, visual language.\n"
-    "Output ONLY the description, no explanation.\n\n"
-    'Examples:\n'
-    'Query: "going to the swimming pool"\n'
-    'Description: a person swimming in a blue pool with a ladder and water waves\n\n'
-    'Query: "cooking dinner"\n'
-    'Description: a person stirring a pot on a stove with vegetables and a knife nearby\n\n'
-    'Query: "visiting the doctor"\n'
-    'Description: a doctor examining a patient with a stethoscope in a medical clinic'
-)
-
-
-def make_hyde_config(base_cfg, llm_model='qwen3.5:4b', backend='ollama'):
-    """Wrap a retrieval config with HyDE (Hypothetical Document Expansion).
-
-    The LLM generates a hypothetical pictogram description from the query.
-    That description is embedded with the same encoder and used for retrieval,
-    bridging the query-document embedding gap in dense retrieval.
-    """
-    def retrieve_fn(sentence, top_k):
-        if backend == 'ollama':
-            import ollama as _ollama
-            resp = _ollama.chat(
-                model=llm_model,
-                messages=[
-                    {"role": "system", "content": _HYDE_SYSTEM},
-                    {"role": "user",   "content": f"/no_think\n{sentence}"},
-                ],
-                think=False,
-            )
-            hyp_doc = resp.message.content.strip()
-        else:
-            hyp_doc = sentence
-        hyp_doc = re.sub(r'<think>[\s\S]*?</think>\s*', '', hyp_doc).strip() or sentence
-        return retrieve(hyp_doc, top_k=top_k,
-                        client=base_cfg['client'],
-                        collection=base_cfg['collection'],
-                        embed_fn=base_cfg['embed_fn'])
-
-    return {'name': f"{base_cfg['name']} + HyDE", 'retrieve_fn': retrieve_fn}
-
-
-def plot_recall_at_k(df, retrieval_configs, k_values, n_samples=100, random_state=42):
+# plots the strict and relaxed Recall@k for each retrieval configuration, querying each model once at max(k_values) and truncating for efficiency
+def plot_recall_at_k(df, retrieval_configs, k_values, n_samples=100, random_state=42, checkpoint_path=None):
     """Elbow plot of strict and relaxed Recall@k for each retrieval config.
     Queries each model once at max(k_values) then truncates — much faster than re-querying per k.
     """
+    import json as _json
     set_seed(random_state)
     max_k = max(k_values)
     sample = df.sample(n=min(n_samples, len(df)), random_state=random_state).reset_index(drop=True)
 
+    _ckpt_done = {}
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        with open(checkpoint_path) as _f:
+            _ckpt_done = _json.load(_f)
+        print(f"Checkpoint loaded: {len(_ckpt_done)} configs done")
+
+    def _ckpt_save():
+        if checkpoint_path:
+            with open(checkpoint_path, 'w') as _f:
+                _json.dump(_ckpt_done, _f, indent=2)
+
     # ── fetch retrieved lists once at max_k ──────────────────────────────
     config_data = {}
     for cfg in retrieval_configs:
-        rows_data = []
-        for _, row in tqdm(sample.iterrows(), total=len(sample), desc=cfg['name']):
-            gt_ids            = [int(cd['pictogram']['id']) for cd in row['concepts']]
-            candidate_id_sets = [{int(c['id']) for c in cd['candidates']} for cd in row['concepts']]
-            query = row['sentence']
-            if 'llm_model' in cfg:
-                query = llm_simplify_query(
-                    query,
-                    model=cfg['llm_model'],
-                    backend=cfg.get('backend', 'ollama'),
-                    bridge=cfg.get('bridge'),
-                )
-                print(f"[llm_simplify] sentence={row['sentence']!r}  query={query!r}", flush=True)
+        if cfg['name'] in _ckpt_done:
+            print(f"  [checkpoint] skipping {cfg['name']}")
+            raw = _ckpt_done[cfg['name']]
+            config_data[cfg['name']] = [
+                (gt_ids, [set(c) for c in cands], retrieved)
+                for gt_ids, cands, retrieved in raw
+            ]
+        else:
+            rows_data = []
+            for _, row in tqdm(sample.iterrows(), total=len(sample), desc=cfg['name']):
+                gt_ids            = [int(cd['pictogram']['id']) for cd in row['concepts']]
+                candidate_id_sets = [{int(c['id']) for c in cd['candidates']} for cd in row['concepts']]
+                query = row['sentence']
+                if 'llm_model' in cfg:
+                    query = llm_simplify_query(
+                        query,
+                        model=cfg['llm_model'],
+                        backend=cfg.get('backend', 'ollama'),
+                        bridge=cfg.get('bridge'),
+                        seed=random_state,
+                    )
+                    print(f"[llm_simplify] sentence={row['sentence']!r}  query={query!r}", flush=True)
 
-            if 'retrieve_fn' in cfg:
-                retrieved = cfg['retrieve_fn'](query, top_k=max_k)
-            else:
-                retrieved = retrieve(query, top_k=max_k,
-                                     client=cfg['client'],
-                                     collection=cfg['collection'],
-                                     embed_fn=cfg['embed_fn'])
-            rows_data.append((gt_ids, candidate_id_sets, retrieved))
-        config_data[cfg['name']] = rows_data
+                if 'retrieve_fn' in cfg:
+                    retrieved = cfg['retrieve_fn'](query, top_k=max_k)
+                else:
+                    retrieved = retrieve(query, top_k=max_k,
+                                         client=cfg['client'],
+                                         collection=cfg['collection'],
+                                         embed_fn=cfg['embed_fn'])
+                rows_data.append((gt_ids, candidate_id_sets, retrieved))
+            config_data[cfg['name']] = rows_data
+            _ckpt_done[cfg['name']] = [
+                (gt_ids, [list(c) for c in cands], retrieved)
+                for gt_ids, cands, retrieved in rows_data
+            ]
+            _ckpt_save()
 
     # ── compute recall@k for each k by truncating ────────────────────────
     strict_results  = {cfg['name']: [] for cfg in retrieval_configs}
@@ -585,14 +572,18 @@ def plot_recall_at_k(df, retrieval_configs, k_values, n_samples=100, random_stat
     return pd.DataFrame(strict_results, index=k_values), pd.DataFrame(relaxed_results, index=k_values)
 
 _bridge_registry: dict = {}
-
+# finds a free port on the local machine by binding a socket to port 0, which tells the OS to select an available port, and then returns that port number.
 def find_free_port():
     with socket.socket() as s:
         s.bind(('', 0))
         return s.getsockname()[1]
 
-
-def create_webllm_bridge(model_id="Qwen2.5-3B-Instruct-q4f16_1-MLC", port=None):
+# creates a Flask web server that acts as a bridge for WebLLM, allowing communication 
+# between a browser-based LLM and a Python backend. It provides endpoints to get prompts,
+#  send responses, list available models, and serve a worker page that runs the model in the 
+# browser using WebGPU. The server listens on a specified port (or finds a free one) and uses 
+# CORS to allow cross-origin requests.
+def create_webllm_bridge(model_id="Qwen2.5-7B-Instruct-q4f16_1-MLC", port=None):
     if port is None:
         port = find_free_port()
 
@@ -743,20 +734,25 @@ def create_webllm_bridge(model_id="Qwen2.5-3B-Instruct-q4f16_1-MLC", port=None):
         target=lambda: app.run(port=port, debug=False, use_reloader=False),
         daemon=True
     ).start()
-    print(f"✅ Bridge Server active on port {port} — model: {model_id}")
+
+    from pyngrok import ngrok as _ngrok
+    tunnel = _ngrok.connect(port)
+    public_url = tunnel.public_url
+    print(f"✅ Bridge Server active — model: {model_id}")
+    print(f"   ngrok public URL: {public_url}")
 
     display(HTML(f"""
         <div style="padding: 20px; border: 3px solid #007acc; border-radius: 10px; background: #eef6ff;">
             <h3 style="margin-top:0;">Step 1: Open the Worker</h3>
-            <p><b>Model:</b> <code>{model_id}</code> &nbsp;|&nbsp; <b>Port:</b> <code>{port}</code></p>
+            <p><b>Model:</b> <code>{model_id}</code></p>
             <p>Click this link to open the worker in a new tab:</p>
-            <a href="http://localhost:{port}/worker" target="_blank" 
+            <a href="{public_url}/worker" target="_blank"
                style="background: #007acc; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; font-weight: bold;">
                OPEN BROWSER WORKER
             </a>
             <p style="margin-top: 15px; font-size: 0.85em; color: #555;">
-                Browse available models: 
-                <a href="http://localhost:{port}/models" target="_blank">http://localhost:{port}/models</a>
+                Browse available models:
+                <a href="{public_url}/models" target="_blank">{public_url}/models</a>
             </p>
         </div>
     """))
@@ -764,6 +760,7 @@ def create_webllm_bridge(model_id="Qwen2.5-3B-Instruct-q4f16_1-MLC", port=None):
     _bridge_registry[port] = bridge_data
     return app, bridge_data, port
 
+# sends the prompt to the browser-based LLM via the bridge and waits for a response, with a timeout.
 def call_browser_llm(bridge_data, prompt, timeout=300):
     bridge_data["gen_id"] = bridge_data.get("gen_id", 0) + 1
     bridge_data["response"] = None
@@ -785,48 +782,48 @@ def call_browser_llm(bridge_data, prompt, timeout=300):
 
     return bridge_data["response"]
 
-def call_llm(sent, model="qwen2.5:7b-instruct", backend="ollama", bridge=None, context=None):
-
-    import textwrap
-
-    board_line = f"Symbols already on the board: {', '.join(context)}.\n" if context else ""
-    system = (
-        "You are an AAC pictogram retrieval assistant.\n"
-        "Extract 3-4 short concept queries from the user message for pictogram search.\n"
-        "Concepts can overlap or be variations of the same idea — prefer broader coverage.\n"
-        + (board_line if board_line else "") +
-        "If the user message is generic or vague (e.g. \"more\", \"add more\"), "
-        "use the board context above to infer related or complementary concepts.\n"
-        'Output ONLY valid JSON (no markdown): {"queries": ["concept 1", "concept 2", "concept 3"]}\n'
-        "Always output at least 3 queries.\n"
-        'Examples:\n'
-        '  message: "I want to go to the swimming pool"\n'
-        '  output: {"queries": ["swimming pool", "swimming", "water sport", "go"]}\n'
-        '  message: "she is eating pizza with friends"\n'
-        '  output: {"queries": ["eating", "pizza", "food", "friends"]}\n'
-        'Each query must be a short phrase or single concept.'
-    )
-    prompt = f"/no_think\nNow extract concepts for this query:\nQuery: \"{sent}\"\nOutput:"
-
-    if backend == "ollama":
-        import ollama
-        response = ollama.chat(
-            model=model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
-            think=False
-        )
-        return response.message.content, {
-            "model": model,
-            "latency_ms": round(response.eval_duration / 1e6, 0),
-            "tokens_per_sec": round(response.eval_count / (response.eval_duration / 1e9), 1)
-        }
-
-    elif backend == "webllm":
-        bridge_data = _bridge_registry[bridge] if isinstance(bridge, int) else bridge
-        full_prompt = "/no_think\n" + system + "\n\n" + f"Now extract concepts for this query:\nQuery: \"{sent}\"\nOutput:"
-        response = call_browser_llm(bridge_data, full_prompt)
-        response = re.sub(r'<think>[\s\S]*?</think>\s*', '', response).strip()
-        return response, bridge_data.get("metrics")
+#def call_llm(sent, model="qwen2.5:7b-instruct", backend="ollama", bridge=None, context=None):
+#
+#    import textwrap
+#
+#    board_line = f"Symbols already on the board: {', '.join(context)}.\n" if context else ""
+#    system = (
+#        "You are an AAC pictogram retrieval assistant.\n"
+#        "Extract 3-4 short concept queries from the user message for pictogram search.\n"
+#        "Concepts can overlap or be variations of the same idea — prefer broader coverage.\n"
+#        + (board_line if board_line else "") +
+#        "If the user message is generic or vague (e.g. \"more\", \"add more\"), "
+#        "use the board context above to infer related or complementary concepts.\n"
+#        'Output ONLY valid JSON (no markdown): {"queries": ["concept 1", "concept 2", "concept 3"]}\n'
+#        "Always output at least 3 queries.\n"
+#        'Examples:\n'
+#        '  message: "I want to go to the swimming pool"\n'
+#        '  output: {"queries": ["swimming pool", "swimming", "water sport", "go"]}\n'
+#        '  message: "she is eating pizza with friends"\n'
+#        '  output: {"queries": ["eating", "pizza", "food", "friends"]}\n'
+#        'Each query must be a short phrase or single concept.'
+#    )
+#    prompt = f"/no_think\nNow extract concepts for this query:\nQuery: \"{sent}\"\nOutput:"
+#
+#    if backend == "ollama":
+#        import ollama
+#        response = ollama.chat(
+#            model=model,
+#            messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+#            think=False
+#        )
+#        return response.message.content, {
+#            "model": model,
+#            "latency_ms": round(response.eval_duration / 1e6, 0),
+#            "tokens_per_sec": round(response.eval_count / (response.eval_duration / 1e9), 1)
+#        }
+#
+#    elif backend == "webllm":
+#        bridge_data = _bridge_registry[bridge] if isinstance(bridge, int) else bridge
+#        full_prompt = "/no_think\n" + system + "\n\n" + f"Now extract concepts for this query:\nQuery: \"{sent}\"\nOutput:"
+#        response = call_browser_llm(bridge_data, full_prompt)
+#        response = re.sub(r'<think>[\s\S]*?</think>\s*', '', response).strip()
+#        return response, bridge_data.get("metrics")
 
 def _parse_llm_list(raw: str):
     import json as _json
@@ -897,7 +894,7 @@ def _run_baselines(retrieve_fn, reranker, sample, pool_k, rerank_n, compute_metr
     return rows_cache, results
 
 
-def _run_llm_simplify_retrieve_only_mode(rows_cache, retrieve_fn, reranker, pool_k, rerank_n, llm_model, backend, bridge, desc):
+def _run_llm_simplify_retrieve_only_mode(rows_cache, retrieve_fn, reranker, pool_k, rerank_n, llm_model, backend, bridge, desc, seed=42):
     """LLM simplified keywords for retrieval only; original sentence used for CE reranking.
 
     Isolates the retrieval benefit of LLM simplification while keeping the CE
@@ -905,7 +902,7 @@ def _run_llm_simplify_retrieve_only_mode(rows_cache, retrieve_fn, reranker, pool
     """
     results = {"strict": [], "relaxed": []}
     for gt_ids, candidate_id_sets, sentence, _, _ in tqdm(rows_cache, desc=desc):
-        simplified = llm_simplify_query(sentence, model=llm_model, backend=backend)
+        simplified = llm_simplify_query(sentence, model=llm_model, backend=backend, seed=seed)
         pool = retrieve_fn(simplified, top_k=pool_k)
         ranked = reranker(sentence, pool, top_n=rerank_n)
         sm = strict_retrieval_metrics(gt_ids, ranked)
@@ -915,7 +912,7 @@ def _run_llm_simplify_retrieve_only_mode(rows_cache, retrieve_fn, reranker, pool
     return results
 
 
-def _run_llm_simplify_retrieve_mode(rows_cache, retrieve_fn, reranker, pool_k, rerank_n, llm_model, backend, bridge, desc):
+def _run_llm_simplify_retrieve_mode(rows_cache, retrieve_fn, reranker, pool_k, rerank_n, llm_model, backend, bridge, desc, seed=42):
     """LLM simplifies the sentence; simplified query used for BOTH retrieval and CE reranking.
 
     Compared to _run_llm_simplify_mode (rerank only), this also changes the pool —
@@ -924,7 +921,7 @@ def _run_llm_simplify_retrieve_mode(rows_cache, retrieve_fn, reranker, pool_k, r
     results = {"strict": [], "relaxed": [], "strict_prec": [], "relaxed_prec": [], "strict_f1": [], "relaxed_f1": [],
                "pool_strict": [], "pool_relaxed": []}
     for gt_ids, candidate_id_sets, sentence, _, _ in tqdm(rows_cache, desc=desc):
-        simplified = llm_simplify_query(sentence, model=llm_model, backend=backend)
+        simplified = llm_simplify_query(sentence, model=llm_model, backend=backend, seed=seed)
         pool = retrieve_fn(simplified, top_k=pool_k)
 
         # pool recall with simplified retrieval
@@ -946,7 +943,7 @@ def _run_llm_simplify_retrieve_mode(rows_cache, retrieve_fn, reranker, pool_k, r
     return results
 
 
-def _run_llm_simplify_mode(rows_cache, reranker, rerank_n, llm_model, backend, bridge, desc):
+def _run_llm_simplify_mode(rows_cache, reranker, rerank_n, llm_model, backend, bridge, desc, seed=42):
     """LLM simplifies the sentence to AAC keywords; CE reranks the pool with that query.
 
     The simplified keyword query matches pictogram descriptions better than the
@@ -955,7 +952,7 @@ def _run_llm_simplify_mode(rows_cache, reranker, rerank_n, llm_model, backend, b
     """
     results = {"strict": [], "relaxed": [], "strict_prec": [], "relaxed_prec": [], "strict_f1": [], "relaxed_f1": []}
     for gt_ids, candidate_id_sets, sentence, pool, _ in tqdm(rows_cache, desc=desc):
-        simplified = llm_simplify_query(sentence, model=llm_model, backend=backend)
+        simplified = llm_simplify_query(sentence, model=llm_model, backend=backend, seed=seed)
         print(f"[llm_simplify] sentence={sentence!r}  rerank_query={simplified!r}", flush=True)
         ranked = reranker(simplified, pool, top_n=rerank_n)
         sm = strict_retrieval_metrics(gt_ids, ranked)
@@ -1420,6 +1417,7 @@ def run_configs(
             all_runs.append(entry)
 
     for seed in random_states:
+        set_seed(seed)
         print(f'\n{"="*60}')
         print(f'Seed: {seed}')
         print(f'{"="*60}')
@@ -1453,7 +1451,7 @@ def run_configs(
                 else:
                     results["llm_simplify"] = _run_llm_simplify_mode(
                         rows_cache, reranker, rerank_n, llm_model, backend, bridge,
-                        desc=f"LLM rerank ({name})"
+                        desc=f"LLM rerank ({name})", seed=seed
                     )
                     s_vals = results["llm_simplify"].get("strict",  [])
                     r_vals = results["llm_simplify"].get("relaxed", [])
@@ -1476,7 +1474,7 @@ def run_configs(
                 else:
                     results["llm_simplify_retrieve_only"] = _run_llm_simplify_retrieve_only_mode(
                         rows_cache, retrieve_fn, reranker, pool_k, rerank_n, llm_model, backend, bridge,
-                        desc=f"LLM pool, noisy rerank ({name})"
+                        desc=f"LLM pool, noisy rerank ({name})", seed=seed
                     )
                     s_vals = results["llm_simplify_retrieve_only"].get("strict",  [])
                     r_vals = results["llm_simplify_retrieve_only"].get("relaxed", [])
@@ -1499,7 +1497,7 @@ def run_configs(
                 else:
                     results["llm_simplify_retrieve"] = _run_llm_simplify_retrieve_mode(
                         rows_cache, retrieve_fn, reranker, pool_k, rerank_n, llm_model, backend, bridge,
-                        desc=f"LLM pool+rerank ({name})"
+                        desc=f"LLM pool+rerank ({name})", seed=seed
                     )
                     s_vals = results["llm_simplify_retrieve"].get("strict",  [])
                     r_vals = results["llm_simplify_retrieve"].get("relaxed", [])
