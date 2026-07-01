@@ -465,6 +465,7 @@ def make_llm_simplify_config(base_cfg, llm_model='qwen3.5:4b', backend='ollama',
     """
     def retrieve_fn(sentence, top_k):
         simplified = llm_simplify_query(sentence, model=llm_model, backend=backend, bridge=bridge, seed=seed)
+        print(f"[llm_simplify] sentence={sentence!r}  query={simplified!r}", flush=True)
         return retrieve(simplified, top_k=top_k,
                         client=base_cfg['client'], collection=base_cfg['collection'],
                         embed_fn=base_cfg['embed_fn'])
