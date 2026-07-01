@@ -9,6 +9,9 @@ __pycache__/
 *.db
 *.db.lock
 
+# Allow the pre-computed embedding databases
+!BDATM/embeddings/**/*.db
+
 # Milvus
 milvus.db
 *.milvus.db
