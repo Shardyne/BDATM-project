@@ -1145,25 +1145,39 @@ def _run_llm_expand_mode(rows_cache, retrieve_fn, reranker, rerank_n, llm_model,
     return results
 
 
+# Single source of truth for run-config labels, shared by print_retrieval_results
+# (per-seed console table) and run_configs (aggregated summary table) so that both
+# tables always use identical names for the same underlying config.
+_MODE_LABELS = {
+    "pool":                       "Pool (noisy)",
+    "sent":                       "CE rerank (noisy pool)",
+    "llm_simplify":               "LLM rerank (noisy pool)",
+    "llm_simplify_retrieve:pool": "Pool (LLM polished)",
+    "llm_simplify_retrieve_only": "CE rerank (LLM pool)",
+    "llm_simplify_retrieve":      "CE rerank (LLM polished)",
+}
+
+
 def print_retrieval_results(results, rerank_n, name=None, modes=None, show_baselines=True):
     def avg(lst): return sum(lst) / len(lst) if lst else None
     header = f"── {name} " if name else "── "
     print(f"\n{header}{'─' * (60 - len(header))}")
     print(f'{"":50} {"Strict":>7} {"Relaxed":>8}')
-    # (result_key, label, is_baseline, required_mode_in_modes)
+    # (result_key, is_baseline, required_mode_in_modes)
     label_specs = [
-        ("pool",                       f"Recall@{rerank_n} (pool — noisy)                        ", True,  None),
-        ("sent",                       f"Recall@{rerank_n} (CE  — noisy, pool+rerank)             ", True,  None),
-        ("llm_simplify",               f"Recall@{rerank_n} (CE  — LLM rerank, noisy pool)         ", False, "llm_simplify"),
-        ("llm_simplify_retrieve:pool", f"Recall@{rerank_n} (pool — LLM polished)                  ", False, "llm_simplify_retrieve"),
-        ("llm_simplify_retrieve_only", f"Recall@{rerank_n} (CE  — LLM pool, noisy rerank)         ", False, "llm_simplify_retrieve_only"),
-        ("llm_simplify_retrieve",      f"Recall@{rerank_n} (CE  — LLM polished, full pipeline)    ", False, "llm_simplify_retrieve"),
+        ("pool",                       True,  None),
+        ("sent",                       True,  None),
+        ("llm_simplify",               False, "llm_simplify"),
+        ("llm_simplify_retrieve:pool", False, "llm_simplify_retrieve"),
+        ("llm_simplify_retrieve_only", False, "llm_simplify_retrieve_only"),
+        ("llm_simplify_retrieve",      False, "llm_simplify_retrieve"),
     ]
-    for key, label, is_baseline, req_mode in label_specs:
+    for key, is_baseline, req_mode in label_specs:
         if is_baseline and not show_baselines:
             continue
         if req_mode is not None and modes is not None and req_mode not in modes:
             continue
+        label = f"Recall@{rerank_n} ({_MODE_LABELS[key]})".ljust(58)
         if ":" in key:
             base, subkey = key.split(":", 1)
             d = results.get(base, {})
@@ -1388,13 +1402,9 @@ def run_configs(
     if random_states is None:
         random_states = [random_state]
 
-    _mode_labels = {
-        "pool":                       f"Pool@{rerank_n}",
-        "sent":                       f"CE sent@{rerank_n}",
-        "llm_simplify":               "LLM rerank",
-        "llm_simplify_retrieve_only": "LLM pool",
-        "llm_simplify_retrieve":      "LLM full",
-    }
+    # Reuse the same labels as print_retrieval_results so the per-seed console
+    # tables and the aggregated summary table always agree on names.
+    _mode_labels = _MODE_LABELS
 
     import json as _json
 
@@ -1532,6 +1542,21 @@ def run_configs(
                     "seed":    seed,
                     "config":  name,
                     "mode":    _mode_labels.get(key, key),
+                    "strict":  float(np.mean(s_vals)) if s_vals else None,
+                    "relaxed": float(np.mean(r_vals)) if r_vals else None,
+                })
+
+            # "llm_simplify_retrieve:pool" — the LLM-polished pool before CE rerank,
+            # a subkey of the llm_simplify_retrieve results. Kept as its own row so
+            # all 6 configs (matching print_retrieval_results) appear in the summary.
+            if show_baselines and "llm_simplify_retrieve" in modes and "llm_simplify_retrieve" in results:
+                d = results["llm_simplify_retrieve"]
+                s_vals = d.get("pool_strict",  [])
+                r_vals = d.get("pool_relaxed", [])
+                all_runs.append({
+                    "seed":    seed,
+                    "config":  name,
+                    "mode":    _mode_labels["llm_simplify_retrieve:pool"],
                     "strict":  float(np.mean(s_vals)) if s_vals else None,
                     "relaxed": float(np.mean(r_vals)) if r_vals else None,
                 })
