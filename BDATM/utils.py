@@ -1239,6 +1239,38 @@ class QwenVLReranker:
             scores.extend(self._model.process(inputs))
         return scores
 
+def _text_rerank_scores(text_reranker, query, docs, batch_size=64):
+    """Score `docs` against `query`, aligned to the original `docs` order.
+
+    Supports two kinds of text_reranker:
+    - Native *listwise* rerankers exposing `.rerank(query, documents, top_n=...)`
+      (e.g. jina-reranker-v3, which attends over the query and all documents
+      jointly in one context window — it is NOT a pointwise cross-encoder and
+      does not accept `.predict((query, doc))` pairs).
+    - Standard *pointwise* `sentence_transformers.CrossEncoder`-style objects
+      exposing `.predict(pairs, batch_size=...)` for (query, doc) pairs.
+    """
+    if hasattr(text_reranker, 'rerank'):
+        results = text_reranker.rerank(query, docs, top_n=len(docs))
+        scores = [0.0] * len(docs)
+        for r in results:
+            scores[r['index']] = r['relevance_score']
+        return scores
+
+    pairs = [(query, d) for d in docs]
+    try:
+        return list(text_reranker.predict(pairs, batch_size=batch_size))
+    except RuntimeError:
+        # fall back to per-pair scoring to avoid 0-length tensor batches
+        scores = []
+        for pair in pairs:
+            try:
+                scores.append(text_reranker.predict([pair], batch_size=1)[0])
+            except RuntimeError:
+                scores.append(0.0)
+        return scores
+
+
 def rerank_pictograms(
     query: str,
     candidate_ids: list[int],
@@ -1252,7 +1284,9 @@ def rerank_pictograms(
 ) -> list[int]:
     """Rerank candidates using a text cross-encoder and/or a VL cross-encoder.
 
-    - text_reranker:  CrossEncoder scoring (query, keyword_text) pairs
+    - text_reranker:  either a pointwise CrossEncoder (.predict on (query, doc)
+                      pairs) or a native listwise reranker (.rerank(query, docs)),
+                      e.g. jina-reranker-v3 — see _text_rerank_scores.
     - image_reranker: CrossEncoder (e.g. Qwen3-VL-Reranker-2B) scoring
                       (query, {'text': keywords, 'image': PIL}) pairs
     - pid_to_image values: {'bytes': bytes, 'keywords': str}
@@ -1285,17 +1319,8 @@ def rerank_pictograms(
                  if p is not None and p[1].strip() and not is_unusable_description(p[1])]
         if valid:
             idxs, pairs = zip(*valid)
-            pairs_list = list(pairs)
-            try:
-                scores = text_reranker.predict(pairs_list, batch_size=batch_size)
-            except RuntimeError:
-                # fall back to per-pair scoring to avoid 0-length tensor batches
-                scores = []
-                for pair in pairs_list:
-                    try:
-                        scores.append(text_reranker.predict([pair], batch_size=1)[0])
-                    except RuntimeError:
-                        scores.append(0.0)
+            docs = [p[1] for p in pairs]
+            scores = _text_rerank_scores(text_reranker, query, docs, batch_size=batch_size)
             raw = np.array(scores, dtype=float)
             raw = (raw - raw.min()) / (raw.max() - raw.min() + 1e-9)
             for i, s in zip(idxs, raw):
