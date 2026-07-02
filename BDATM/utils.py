@@ -736,11 +736,17 @@ def create_webllm_bridge(model_id="Qwen2.5-7B-Instruct-q4f16_1-MLC", port=None):
         daemon=True
     ).start()
 
-    from pyngrok import ngrok as _ngrok
-    tunnel = _ngrok.connect(port)
-    public_url = tunnel.public_url
-    print(f"✅ Bridge Server active — model: {model_id}")
-    print(f"   ngrok public URL: {public_url}")
+    try:
+        import google.colab  # only present in Colab
+        from pyngrok import ngrok as _ngrok
+        tunnel = _ngrok.connect(port)
+        public_url = tunnel.public_url
+        print(f"✅ Bridge Server active — model: {model_id}")
+        print(f"   ngrok public URL: {public_url}")
+    except ImportError:
+        public_url = f"http://localhost:{port}"
+        print(f"✅ Bridge Server active — model: {model_id}")
+        print(f"   local URL: {public_url}")
 
     display(HTML(f"""
         <div style="padding: 20px; border: 3px solid #007acc; border-radius: 10px; background: #eef6ff;">
@@ -1559,3 +1565,113 @@ def run_configs(
         _plot_run_configs(agg, t_crit, n_seeds)
 
     return runs_df, summary
+
+
+def create_pictogram_server(
+    milvus_client,
+    collection: str,
+    embed_fn,
+    reranker,
+    pid_to_description: dict,
+    llm_model: str = "qwen3.5:4b",
+    static_dir: str = "static",
+    port: int = None,
+):
+    """Start a FastAPI pictogram retrieval server and display a clickable link.
+
+    Parameters
+    ----------
+    milvus_client      : MilvusClient — vector DB to retrieve from
+    collection         : str          — collection name inside the client
+    embed_fn           : callable     — query embedding function (embed_query)
+    reranker           : CrossEncoder — cross-encoder for reranking
+    pid_to_description : dict         — {pid: keyword_string} for reranker input
+    llm_model          : str          — Ollama model for query simplification
+    static_dir         : str          — directory containing index.html
+    port               : int          — port to listen on (auto if None)
+    """
+    from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.staticfiles import StaticFiles
+    from pydantic import BaseModel
+    import uvicorn
+
+    if port is None:
+        port = find_free_port()
+
+    app = FastAPI()
+    app.add_middleware(
+        CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+    )
+
+    class _RetrieveReq(BaseModel):
+        query: str
+        model: str = llm_model
+        top_k: int = 400
+        rerank_n: int = 50
+
+    class _ChatReq(BaseModel):
+        messages: list[dict]
+        model: str = llm_model
+
+    @app.post("/retrieve")
+    async def _retrieve(req: _RetrieveReq):
+        pool = retrieve(req.query, top_k=req.top_k,
+                        client=milvus_client, collection=collection,
+                        embed_fn=embed_fn)
+        rq = llm_simplify_query(req.query, model=req.model, backend="ollama")
+        print(f"[/retrieve] query={req.query!r}  simplified={rq!r}  pool={len(pool)}", flush=True)
+        ranked_ids = rerank_pictograms(rq, pool, top_n=req.rerank_n,
+                                       pid_to_description=pid_to_description,
+                                       text_reranker=reranker)
+        symbols = [
+            {"id": pid, "text": pid_to_description.get(pid, str(pid)),
+             "img_url": f"https://static.arasaac.org/pictograms/{pid}/{pid}_300.png"}
+            for pid in ranked_ids
+        ]
+        return {"symbols": symbols, "rerank_query": rq}
+
+    @app.post("/chat")
+    async def _chat(req: _ChatReq):
+        import ollama as _ollama
+        resp = _ollama.chat(model=req.model, messages=req.messages, think=False)
+        metrics = {"model": req.model}
+        try:
+            metrics["latency_ms"]     = round(resp.eval_duration / 1e6, 0)
+            metrics["tokens_per_sec"] = round(resp.eval_count / (resp.eval_duration / 1e9), 1)
+        except Exception:
+            pass
+        return {"content": resp.message.content, "metrics": metrics}
+
+    app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
+
+    threading.Thread(
+        target=lambda: uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning"),
+        daemon=True
+    ).start()
+
+    try:
+        import google.colab
+        from pyngrok import ngrok as _ngrok
+        public_url = _ngrok.connect(port).public_url
+    except ImportError:
+        public_url = f"http://localhost:{port}"
+
+    display(HTML(f"""
+        <div style='padding:20px; border:3px solid #ff6b35; border-radius:10px; background:#fff8f5;'>
+            <h3 style='margin-top:0;'>&#128483; ARASAAC Symbol Finder</h3>
+            <p><b>Retrieval:</b> <code>{collection}</code> &nbsp;|&nbsp;
+               <b>Reranker:</b> <code>{type(reranker).__name__}</code> &nbsp;|&nbsp;
+               <b>LLM:</b> <code>{llm_model}</code> (Ollama)</p>
+            <a href='{public_url}' target='_blank'
+               style='display:inline-block; background:#ff6b35; color:white; padding:10px 24px;
+                      text-decoration:none; border-radius:6px; font-weight:bold; font-size:1rem;'>
+               OPEN WEB APP
+            </a>
+            <p style='margin-top:12px; font-size:0.82em; color:#888;'>
+                Server running at <code>{public_url}</code>
+            </p>
+        </div>
+    """))
+
+    return app, port
