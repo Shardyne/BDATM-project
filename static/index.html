@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ARASAAC Symbol Finder</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #f5f0e8; --surface: #fffdf7; --border: #e2d9c8;
+      --accent: #ff6b35; --accent2: #4ecdc4; --text: #2d2416;
+      --muted: #8c7e6a; --selected: #ff6b35; --radius: 14px;
+      --shadow: 0 2px 12px rgba(0,0,0,0.08);
+    }
+    html, body { height: 100%; overflow: hidden; font-family: "Nunito", sans-serif; background: var(--bg); color: var(--text); }
+    .app { display: grid; grid-template-columns: 340px 1fr; grid-template-rows: auto 1fr auto; height: 100vh; max-width: 1400px; margin: 0 auto; }
+    header { grid-column: 1 / -1; display: flex; align-items: center; gap: 16px; padding: 12px 20px; background: var(--surface); border-bottom: 2px solid var(--border); flex-wrap: wrap; }
+    .logo { display: flex; align-items: center; gap: 10px; }
+    .logo-icon { width: 36px; height: 36px; background: var(--accent); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 20px; }
+    .logo h1 { font-size: 1.2rem; font-weight: 800; letter-spacing: -0.3px; }
+    .logo h1 span { color: var(--accent); }
+    .selectors { display: flex; gap: 10px; align-items: center; }
+    .selectors label { font-size: 0.72rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); }
+    .selectors select { padding: 5px 10px; border: 1.5px solid var(--border); border-radius: 8px; font-family: "Nunito", sans-serif; font-size: 0.82rem; background: var(--bg); color: var(--text); cursor: pointer; transition: border-color 0.15s; }
+    .selectors select:focus { outline: none; border-color: var(--accent); }
+    #status-bar { font-family: "Space Mono", monospace; font-size: 0.72rem; color: var(--muted); background: var(--bg); padding: 6px 12px; border-radius: 20px; border: 1px solid var(--border); flex: 1; min-width: 0; text-overflow: ellipsis; overflow: hidden; white-space: nowrap; }
+    #clear-btn { background: none; border: 1.5px solid var(--border); border-radius: 8px; padding: 6px 14px; font-family: "Nunito", sans-serif; font-size: 0.82rem; font-weight: 700; color: var(--muted); cursor: pointer; transition: all 0.15s; white-space: nowrap; }
+    #clear-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .chat-panel { grid-row: 2 / 3; display: flex; flex-direction: column; min-height: 0; overflow: hidden; border-right: 2px solid var(--border); background: var(--surface); }
+    #chat-log { flex: 1; overflow-y: auto; padding: 20px 16px; display: flex; flex-direction: column; gap: 10px; }
+    .bubble { max-width: 88%; padding: 10px 14px; border-radius: var(--radius); font-size: 0.9rem; line-height: 1.5; animation: fadeUp 0.2s ease; }
+    @keyframes fadeUp { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+    .bubble.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+    .bubble.assistant { align-self: flex-start; background: var(--bg); border: 1.5px solid var(--border); border-bottom-left-radius: 4px; }
+    .chat-input { display: flex; gap: 8px; padding: 14px; border-top: 2px solid var(--border); }
+    #query { flex: 1; padding: 10px 14px; border: 2px solid var(--border); border-radius: 10px; font-family: "Nunito", sans-serif; font-size: 0.9rem; background: var(--bg); color: var(--text); outline: none; transition: border-color 0.15s; }
+    #query:focus { border-color: var(--accent); }
+    #query:disabled { opacity: 0.5; }
+    #send-btn { padding: 10px 18px; background: var(--accent); color: #fff; border: none; border-radius: 10px; font-family: "Nunito", sans-serif; font-size: 0.9rem; font-weight: 700; cursor: pointer; transition: opacity 0.15s, transform 0.1s; }
+    #send-btn:hover:not(:disabled) { opacity: 0.88; transform: scale(1.03); }
+    #send-btn:disabled { opacity: 0.4; cursor: default; }
+    .symbol-area { grid-row: 2 / 3; display: flex; flex-direction: column; overflow: hidden; }
+    .section-title { padding: 14px 20px 8px; font-size: 0.72rem; font-weight: 800; letter-spacing: 1.2px; text-transform: uppercase; color: var(--muted); }
+    #symbol-grid { flex: 1; overflow-y: auto; padding: 8px 16px 16px; display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 12px; align-content: start; }
+    .empty-hint { grid-column: 1/-1; text-align: center; color: var(--muted); font-size: 0.9rem; padding: 40px 0; }
+    .symbol-card { background: var(--surface); border: 2px solid var(--border); border-radius: var(--radius); padding: 10px 8px 8px; display: flex; flex-direction: column; align-items: center; gap: 6px; transition: border-color 0.15s, transform 0.12s, box-shadow 0.15s; }
+    .symbol-card:hover { border-color: var(--accent2); transform: translateY(-2px); box-shadow: var(--shadow); }
+    .symbol-card img { width: 72px; height: 72px; object-fit: contain; }
+    .symbol-card span { font-size: 0.72rem; font-weight: 700; text-align: center; color: var(--text); line-height: 1.3; }
+    .card-actions { display: flex; gap: 4px; width: 100%; }
+    .btn-keep { flex: 1; padding: 4px 0; background: #e8f5e9; border: 1.5px solid #4caf50; border-radius: 6px; font-family: "Nunito", sans-serif; font-size: 0.68rem; font-weight: 700; color: #2e7d32; cursor: pointer; transition: background 0.1s; }
+    .btn-keep:hover { background: #c8e6c9; }
+    .btn-remove { flex: 1; padding: 4px 0; background: #fff0f0; border: 1.5px solid #ef5350; border-radius: 6px; font-family: "Nunito", sans-serif; font-size: 0.68rem; font-weight: 700; color: #c62828; cursor: pointer; transition: background 0.1s; }
+    .btn-remove:hover { background: #ffcdd2; }
+    .selected-section { grid-column: 1 / -1; border-top: 2px solid var(--border); background: var(--surface); padding: 12px 20px; }
+    #selected-bar { display: flex; flex-wrap: wrap; gap: 8px; min-height: 40px; align-items: center; }
+    .hint { font-size: 0.82rem; color: var(--muted); font-style: italic; }
+    .selected-chip { display: flex; align-items: center; gap: 6px; background: #e8f5e9; border: 1.5px solid #4caf50; border-radius: 20px; padding: 4px 10px 4px 6px; animation: fadeUp 0.15s ease; }
+    .selected-chip img { width: 28px; height: 28px; object-fit: contain; }
+    .selected-chip span { font-size: 0.78rem; font-weight: 700; }
+    .selected-chip button { background: none; border: none; color: var(--muted); font-size: 1rem; cursor: pointer; line-height: 1; padding: 0 2px; transition: color 0.1s; }
+    .selected-chip button:hover { color: var(--accent); }
+    #concepts-bar { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 20px 10px; min-height: 0; }
+    .concept-chip { font-size: 0.72rem; font-weight: 700; padding: 3px 10px; border-radius: 20px; background: #e8f4fd; border: 1.5px solid #90caf9; color: #1565c0; letter-spacing: 0.2px; }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  </style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="logo">
+      <div class="logo-icon">&#128483;</div>
+      <h1>ARASAAC <span>Finder</span></h1>
+    </div>
+    <div class="selectors">
+      <label>LLM</label>
+      <select id="backend">
+        <option value="ollama">Ollama (local)</option>
+        <option value="webllm">WebLLM (in-browser)</option>
+      </select>
+    </div>
+    <div id="status-bar">Ready &#10003; &#8212; select backend and ask away</div>
+    <button id="clear-btn">&#8635; Reset</button>
+  </header>
+  <section class="chat-panel">
+    <div id="chat-log"></div>
+    <div class="chat-input">
+      <input id="query" type="text" placeholder="e.g. symbols for going to the swimming pool&#8230;" autocomplete="off" />
+      <button id="send-btn">Send</button>
+    </div>
+  </section>
+  <section class="symbol-area">
+    <div class="section-title">Symbol suggestions &#8212; mark each as Keep or Remove</div>
+    <div id="concepts-bar"></div>
+    <div id="symbol-grid">
+      <p class="empty-hint">No symbols yet &#8212; ask me something!</p>
+    </div>
+  </section>
+  <section class="selected-section">
+    <div style="display:flex;align-items:center;gap:12px;padding:14px 20px 8px;">
+      <span class="section-title" style="padding:0;">Your board &#8212; kept symbols</span>
+      <button id="clear-board-btn" style="background:none;border:1.5px solid var(--border);border-radius:8px;padding:4px 12px;font-family:'Nunito',sans-serif;font-size:0.75rem;font-weight:700;color:var(--muted);cursor:pointer;transition:all 0.15s;">&#10005; Remove all</button>
+    </div>
+    <div id="selected-bar">
+      <span class="hint">Mark symbols &#10003; Keep above to add them to your board</span>
+    </div>
+  </section>
+</div>
+<script type="module">
+import * as webllm from "https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm/+esm";
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let keptSymbols = new Map();   // id → {id, text, img_url}  user satisfied
+let removedIds  = new Set();   // user rejected
+let pool        = new Map();   // id → symbol  retrieved but undecided
+let chatHistory = [];
+let engine      = null;
+let rankedQueue = [];           // pre-fetched symbols waiting to slide into pool
+const DISPLAY_SIZE = 20;        // symbols shown at a time
+
+// ── DOM refs ──────────────────────────────────────────────────────────────────
+const statusBar   = document.getElementById("status-bar");
+const chatLog     = document.getElementById("chat-log");
+const queryInput  = document.getElementById("query");
+const sendBtn     = document.getElementById("send-btn");
+const symbolGrid  = document.getElementById("symbol-grid");
+const selectedBar = document.getElementById("selected-bar");
+const clearBtn      = document.getElementById("clear-btn");
+const clearBoardBtn = document.getElementById("clear-board-btn");
+const conceptsBar = document.getElementById("concepts-bar");
+const backendSel  = document.getElementById("backend");
+
+// ── Fixed models — the reranker lives in the backend; the user only picks the LLM
+const OLLAMA_MODEL = "qwen3.5:4b";
+const WEBLLM_MODEL = "Llama-3.2-3B-Instruct-q4f16_1-MLC";
+
+function setStatus(msg) { statusBar.textContent = msg; }
+
+// ── Backend switcher ──────────────────────────────────────────────────────────
+backendSel.addEventListener("change", () => {
+  if (backendSel.value === "webllm") {
+    setStatus("WebLLM selected — model loads on first query");
+  } else {
+    engine = null;
+    setStatus("Ollama selected — server must be running on :8023");
+  }
+});
+
+// ── LLM abstraction ───────────────────────────────────────────────────────────
+async function ensureWebLLM() {
+  if (engine) return;
+  const model = WEBLLM_MODEL;
+  setStatus(`Loading ${model} — first run may take a few minutes…`);
+  engine = await webllm.CreateMLCEngine(model, { initProgressCallback: p => setStatus(p.text) });
+  setStatus("WebLLM ready ✓");
+}
+
+// Mirrors call_llm_messages in the notebook: accepts a messages list,
+// routes to the in-browser engine (WebLLM) or the server /chat endpoint (Ollama).
+const INTERACTION_MODEL = "qwen3.5:4b";   // fixed model for chat replies
+
+async function llmChat(messages, modelOverride = null) {
+  if (backendSel.value === "webllm") {
+    await ensureWebLLM();
+    const r = await engine.chat.completions.create({ messages });
+    return r.choices[0].message.content.trim();
+  } else {
+    const r = await fetch("/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages, model: modelOverride ?? OLLAMA_MODEL })
+    });
+    if (!r.ok) throw new Error(`/chat returned ${r.status}`);
+    return (await r.json()).content.trim();
+  }
+}
+
+// ── Retrieval ─────────────────────────────────────────────────────────────────
+async function retrieveSymbols(query, topK = 400, rerankN = 50) {
+  const r = await fetch("/retrieve", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, top_k: topK, rerank_n: rerankN })
+  });
+  if (!r.ok) throw new Error(`/retrieve returned ${r.status}`);
+  return await r.json();
+}
+
+// ── Iterative RAG handler ─────────────────────────────────────────────────────
+async function handleQuery(userMessage) {
+  appendBubble(userMessage, "user");
+  sendBtn.disabled = true;
+  queryInput.disabled = true;
+  setStatus("Thinking…");
+
+  // Fresh pool for each new query — kept/removed decisions are preserved
+  pool.clear();
+
+  try {
+    const keptTexts = [...keptSymbols.values()].map(s => s.text);
+
+    // ── Conversational reply ──────────────────────────────────────────────────
+    const replySystem =
+      `You are a friendly AAC assistant helping build pictogram boards.\n` +
+      `Kept symbols so far: ${keptTexts.length ? keptTexts.join(", ") : "none yet"}\n` +
+      `IMPORTANT: You CANNOT add, remove, or change symbols yourself — only the user can do that by clicking the Keep/Remove buttons. ` +
+      `Never say "I will remove X", "let me take out X", or "I've added X". ` +
+      `Instead, guide the user: tell them which button to click. ` +
+      `Write a warm 1-2 sentence reply acknowledging the request and directing the user to use the Keep/Remove buttons on the symbols shown.`;
+
+    let reply = "Here are some relevant symbols — keep the ones you need!";
+    try {
+      reply = await llmChat(
+        [{ role: "system", content: replySystem }, ...chatHistory, { role: "user", content: userMessage }],
+        INTERACTION_MODEL   // fixed model
+      );
+    } catch { /* keep fallback */ }
+
+    setStatus("Retrieving…");
+    rankedQueue = [];
+    const data = await retrieveSymbols(userMessage, 400, 50);
+    const symbols = data.symbols ?? [];
+    // Show the server-side simplified rerank query (from llm_simplify_query)
+    conceptsBar.innerHTML = `<span class="concept-chip">${data.rerank_query ?? ""}</span>`;
+    for (const s of symbols) {
+      if (keptSymbols.has(s.id) || removedIds.has(s.id)) continue;
+      if (pool.size < DISPLAY_SIZE) pool.set(s.id, s);
+      else rankedQueue.push(s);
+    }
+
+    chatHistory.push({ role: "user",      content: userMessage });
+    chatHistory.push({ role: "assistant", content: reply });
+    if (chatHistory.length > 20) chatHistory = chatHistory.slice(-20);
+
+    appendBubble(reply, "assistant");
+    setStatus(`Ready ✓ — ${pool.size} symbols to explore`);
+    renderPool();
+    renderBoard();
+  } catch (err) {
+    appendBubble("Sorry, something went wrong: " + err.message, "assistant");
+    setStatus("Error — check console");
+    console.error(err);
+  } finally {
+    sendBtn.disabled = false;
+    queryInput.disabled = false;
+    queryInput.focus();
+  }
+}
+
+
+
+// ── Symbol actions ────────────────────────────────────────────────────────────
+function fillFromQueue() {
+  while (rankedQueue.length && pool.size < DISPLAY_SIZE) {
+    const next = rankedQueue.shift();
+    if (!keptSymbols.has(next.id) && !removedIds.has(next.id)) pool.set(next.id, next);
+  }
+}
+
+function keepSymbol(id) {
+  const s = pool.get(id);
+  if (s) { keptSymbols.set(id, s); pool.delete(id); }
+  fillFromQueue();
+  renderPool(); renderBoard();
+}
+
+function removeSymbol(id) {
+  removedIds.add(id);
+  pool.delete(id);
+  keptSymbols.delete(id);
+  fillFromQueue();
+  renderPool(); renderBoard();
+}
+
+function removeFromBoard(id) {
+  removedIds.add(id);
+  keptSymbols.delete(id);
+  renderBoard();
+}
+
+// ── Render helpers ────────────────────────────────────────────────────────────
+function renderPool() {
+  symbolGrid.innerHTML = "";
+  const items = [...pool.values()].slice(0, 40);
+  if (!items.length) {
+    symbolGrid.innerHTML = `<p class="empty-hint">No symbols to explore — ask me something!</p>`;
+    return;
+  }
+  for (const s of items) {
+    const card = document.createElement("div");
+    card.className = "symbol-card";
+
+    const img = document.createElement("img");
+    img.src = s.img_url; img.alt = s.text; img.loading = "lazy";
+
+    const label = document.createElement("span");
+    label.textContent = s.text;
+
+    const actions = document.createElement("div");
+    actions.className = "card-actions";
+
+    const keepBtn = document.createElement("button");
+    keepBtn.className = "btn-keep"; keepBtn.textContent = "✓ Keep";
+    keepBtn.addEventListener("click", () => keepSymbol(s.id));
+
+    const rmBtn = document.createElement("button");
+    rmBtn.className = "btn-remove"; rmBtn.textContent = "✗ Remove";
+    rmBtn.addEventListener("click", () => removeSymbol(s.id));
+
+    actions.appendChild(keepBtn); actions.appendChild(rmBtn);
+    card.appendChild(img); card.appendChild(label); card.appendChild(actions);
+    symbolGrid.appendChild(card);
+  }
+}
+
+function renderBoard() {
+  selectedBar.innerHTML = "";
+  if (!keptSymbols.size) {
+    selectedBar.innerHTML = `<span class="hint">Mark symbols ✓ Keep above to add them to your board</span>`;
+    return;
+  }
+  for (const [id, s] of keptSymbols) {
+    const chip = document.createElement("div");
+    chip.className = "selected-chip";
+
+    const img = document.createElement("img");
+    img.src = s.img_url; img.alt = s.text;
+
+    const lbl = document.createElement("span");
+    lbl.textContent = s.text;
+
+    const rmBtn = document.createElement("button");
+    rmBtn.textContent = "×";
+    rmBtn.addEventListener("click", () => removeFromBoard(id));
+
+    chip.appendChild(img); chip.appendChild(lbl); chip.appendChild(rmBtn);
+    selectedBar.appendChild(chip);
+  }
+}
+
+function appendBubble(text, role) {
+  const div = document.createElement("div");
+  div.className = `bubble ${role}`;
+  div.textContent = text;
+  chatLog.appendChild(div);
+  chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+// ── Event listeners ───────────────────────────────────────────────────────────
+sendBtn.addEventListener("click", async () => {
+  const q = queryInput.value.trim();
+  if (!q) return;
+  queryInput.value = "";
+  await handleQuery(q);
+});
+
+queryInput.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendBtn.click(); }
+});
+
+clearBoardBtn.addEventListener("click", () => {
+  keptSymbols.clear();
+  renderBoard();
+});
+
+clearBtn.addEventListener("click", () => {
+  rankedQueue = [];
+  keptSymbols.clear(); removedIds.clear(); pool.clear(); chatHistory = [];
+  conceptsBar.innerHTML = "";
+  chatLog.innerHTML = ""; renderPool(); renderBoard();
+  setStatus("Ready ✓");
+});
+</script>
+</body>
+</html>

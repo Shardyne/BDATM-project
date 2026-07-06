@@ -1,20 +1,21 @@
 import random
 import io
+import json
+import math
+import glob
 import matplotlib.pyplot as plt
 from PIL import Image
 import numpy as np
 import os
-from tqdm import tqdm
 import re
+from scipy.stats import t as t_dist
 from sentence_transformers import SentenceTransformer as ST
 import pandas as pd
-import warnings
 import socket
 import threading
 from IPython.display import display, HTML
 import time
 from tqdm.notebook import tqdm
-import ast
 
 
 # check for unusable description text (mojibake, etc.)
@@ -325,19 +326,16 @@ def retrieve(query, top_k, client, collection, embed_fn):
 # across multiple random states, and confidence intervals are calculated. It supports a custom retrieval function for each configuration, 
 # allowing for flexibility in how the retrieval is performed. Optionally, it can plot the results.
 def evaluate_retrieval(df, retrieval_configs, n_samples=100, random_states=[42, 10, 99], k=200, plot=False, checkpoint_path=None):
-    import json as _json
-    from scipy.stats import t as t_dist
-
     _ckpt_done = {}
     if checkpoint_path and os.path.exists(checkpoint_path):
         with open(checkpoint_path) as _f:
-            _ckpt_done = _json.load(_f)
+            _ckpt_done = json.load(_f)
         print(f"Checkpoint loaded: {len(_ckpt_done)} entries done")
 
     def _ckpt_save():
         if checkpoint_path:
             with open(checkpoint_path, 'w') as _f:
-                _json.dump(_ckpt_done, _f, indent=2)
+                json.dump(_ckpt_done, _f, indent=2)
 
     all_runs = []
 
@@ -484,7 +482,6 @@ def plot_recall_at_k(df, retrieval_configs, k_values, n_samples=100, random_stat
     """Elbow plot of strict and relaxed Recall@k for each retrieval config.
     Queries each model once at max(k_values) then truncates — much faster than re-querying per k.
     """
-    import json as _json
     set_seed(random_state)
     max_k = max(k_values)
     sample = df.sample(n=min(n_samples, len(df)), random_state=random_state).reset_index(drop=True)
@@ -492,13 +489,13 @@ def plot_recall_at_k(df, retrieval_configs, k_values, n_samples=100, random_stat
     _ckpt_done = {}
     if checkpoint_path and os.path.exists(checkpoint_path):
         with open(checkpoint_path) as _f:
-            _ckpt_done = _json.load(_f)
+            _ckpt_done = json.load(_f)
         print(f"Checkpoint loaded: {len(_ckpt_done)} configs done")
 
     def _ckpt_save():
         if checkpoint_path:
             with open(checkpoint_path, 'w') as _f:
-                _json.dump(_ckpt_done, _f, indent=2)
+                json.dump(_ckpt_done, _f, indent=2)
 
     # ── fetch retrieved lists once at max_k ──────────────────────────────
     config_data = {}
@@ -832,32 +829,39 @@ def call_browser_llm(bridge_data, prompt, timeout=300):
 #        response = re.sub(r'<think>[\s\S]*?</think>\s*', '', response).strip()
 #        return response, bridge_data.get("metrics")
 
-def _parse_llm_list(raw: str):
-    import json as _json
-    clean = re.sub(r'<think>[\s\S]*?</think>\s*', '', raw).strip()
-    # try {"queries": [...]} JSON format (matches frontend output)
-    try:
-        clean_json = clean.replace('```json', '').replace('```', '').strip()
-        parsed = _json.loads(clean_json)
-        if isinstance(parsed, dict) and isinstance(parsed.get("queries"), list):
-            return [str(q) for q in parsed["queries"] if q]
-    except (ValueError, KeyError):
-        pass
-    # fall back to bracket list format ["a", "b"]
-    match = re.search(r'\[([^\[\]]*)\]', clean, re.DOTALL)
-    if match:
-        try:
-            result = ast.literal_eval('[' + match.group(1) + ']')
-            if isinstance(result, list):
-                return [str(x) for x in result]
-        except (ValueError, SyntaxError):
-            pass
-        items = [s.strip().strip('"\'\'') for s in match.group(1).split(',')]
-        items = [s for s in items if s]
-        if items:
-            return items
-    return None
+# the function attempts to parse a raw string into a list of queries, handling different formats 
+# and cleaning up any unwanted tags. It first tries to parse the string as JSON, looking for a "queries" 
+# key. If that fails, it looks for a bracketed list format and extracts the items. If both methods fail, 
+# it returns None.
+#def _parse_llm_list(raw: str):
+#    import json as _json
+#    clean = re.sub(r'<think>[\s\S]*?</think>\s*', '', raw).strip()
+#    # try {"queries": [...]} JSON format (matches frontend output)
+#    try:
+#        clean_json = clean.replace('```json', '').replace('```', '').strip()
+#        parsed = _json.loads(clean_json)
+#        if isinstance(parsed, dict) and isinstance(parsed.get("queries"), list):
+#            return [str(q) for q in parsed["queries"] if q]
+#    except (ValueError, KeyError):
+#        pass
+#    # fall back to bracket list format ["a", "b"]
+#    match = re.search(r'\[([^\[\]]*)\]', clean, re.DOTALL)
+#    if match:
+#        try:
+#            result = ast.literal_eval('[' + match.group(1) + ']')
+#            if isinstance(result, list):
+#                return [str(x) for x in result]
+#        except (ValueError, SyntaxError):
+#            pass
+#        items = [s.strip().strip('"\'\'') for s in match.group(1).split(',')]
+#        items = [s for s in items if s]
+#        if items:
+#            return items
+#    return None
 
+# this function runs the baselines in the reranking pipeline: the pools for the noisy, the reranking
+# with the noisy sentence at both stages. These are the quantities which do not depend on the LLM simplification, 
+# and can be cached for reuse in the LLM experiments.
 def _run_baselines(retrieve_fn, reranker, sample, pool_k, rerank_n, compute_metrics=True):
     """Compute pool/sent/oracle modes once; cache per-row pools for LLM reuse.
 
@@ -881,7 +885,6 @@ def _run_baselines(retrieve_fn, reranker, sample, pool_k, rerank_n, compute_metr
         if compute_metrics:
             reranked_sent = reranker(sentence, pool, top_n=rerank_n)
 
-            import math
             n_per_oracle = math.ceil(rerank_n / len(oracle_concepts))
             oracle_ids: set[int] = set()
             for concept in oracle_concepts:
@@ -900,7 +903,9 @@ def _run_baselines(retrieve_fn, reranker, sample, pool_k, rerank_n, compute_metr
 
     return rows_cache, results
 
-
+# runs the LLM simplification and retrieval pipeline in "retrieve only" mode, where the LLM simplifies the query for retrieval, 
+# but the original sentence is used for CE reranking. This isolates the retrieval benefit of LLM simplification while keeping the 
+# CE query faithful to the original sentence for scoring.
 def _run_llm_simplify_retrieve_only_mode(rows_cache, retrieve_fn, reranker, pool_k, rerank_n, llm_model, backend, bridge, desc, seed=42):
     """LLM simplified keywords for retrieval only; original sentence used for CE reranking.
 
@@ -918,7 +923,8 @@ def _run_llm_simplify_retrieve_only_mode(rows_cache, retrieve_fn, reranker, pool
         results["relaxed"].append(rm["recall"])
     return results
 
-
+# the LLM polsihing runs both the retrieval and reranking stages with the simplified query, allowing us 
+# to see the full effect of LLM simplification on both stages of the pipeline.
 def _run_llm_simplify_retrieve_mode(rows_cache, retrieve_fn, reranker, pool_k, rerank_n, llm_model, backend, bridge, desc, seed=42):
     """LLM simplifies the sentence; simplified query used for BOTH retrieval and CE reranking.
 
@@ -949,7 +955,8 @@ def _run_llm_simplify_retrieve_mode(rows_cache, retrieve_fn, reranker, pool_k, r
         results["relaxed_f1"].append(rm["f1"])
     return results
 
-
+# the LLM polishing is used just in the reranking stage while the original sentence is used for retrieval.
+#  This allows us to see how much the LLM simplification helps in the reranking stage alone.
 def _run_llm_simplify_mode(rows_cache, reranker, rerank_n, llm_model, backend, bridge, desc, seed=42):
     """LLM simplifies the sentence to AAC keywords; CE reranks the pool with that query.
 
@@ -973,176 +980,176 @@ def _run_llm_simplify_mode(rows_cache, reranker, rerank_n, llm_model, backend, b
     return results
 
 
-def _run_llm_mode(rows_cache, reranker, rerank_n, llm_model, backend, bridge, desc):
-    """Rerank pool candidates using per-concept queries (budget split across concepts)."""
-    import math
-    results = {"strict": [], "relaxed": []}
-    for gt_ids, candidate_id_sets, sentence, pool, _ in tqdm(rows_cache, desc=desc):
-        raw, _ = call_llm(sentence, model=llm_model, backend=backend, bridge=bridge)
-        llm_concepts = _parse_llm_list(raw) or [sentence]
-        tqdm.write(f"  [{sentence[:50]}] → {llm_concepts}")
-        n_per = math.ceil(rerank_n / len(llm_concepts))
-        llm_ids: set[int] = set()
-        for concept in llm_concepts:
-            llm_ids.update(reranker(concept, pool, top_n=n_per))
-        ranked = list(llm_ids)
-        results["strict"].append(strict_retrieval_metrics(gt_ids, ranked)["recall"])
-        results["relaxed"].append(relaxed_retrieval_metrics(gt_ids, ranked, candidate_id_sets)["recall"])
-    return results
+#def _run_llm_mode(rows_cache, reranker, rerank_n, llm_model, backend, bridge, desc):
+#    """Rerank pool candidates using per-concept queries (budget split across concepts)."""
+#    import math
+#    results = {"strict": [], "relaxed": []}
+#    for gt_ids, candidate_id_sets, sentence, pool, _ in tqdm(rows_cache, desc=desc):
+#        raw, _ = call_llm(sentence, model=llm_model, backend=backend, bridge=bridge)
+#        llm_concepts = _parse_llm_list(raw) or [sentence]
+#        tqdm.write(f"  [{sentence[:50]}] → {llm_concepts}")
+#        n_per = math.ceil(rerank_n / len(llm_concepts))
+#        llm_ids: set[int] = set()
+#        for concept in llm_concepts:
+#            llm_ids.update(reranker(concept, pool, top_n=n_per))
+#        ranked = list(llm_ids)
+#        results["strict"].append(strict_retrieval_metrics(gt_ids, ranked)["recall"])
+#        results["relaxed"].append(relaxed_retrieval_metrics(gt_ids, ranked, candidate_id_sets)["recall"])
+#    return results
+#
+#
+#def _run_llm_listwise_mode(rows_cache, reranker, rerank_n, pid_to_description, llm_model, backend, bridge, desc, ce_n=60):
+#    """Cross-encoder shortlists ce_n candidates, LLM reorders and we keep top rerank_n.
+#
+#    ce_n > rerank_n means the LLM can surface items the CE ranked below rerank_n,
+#    actually changing the returned set and improving recall — not just reordering.
+#    One LLM call per sentence.
+#    """
+#    import json as _json
+#    import ollama as _ollama
+#
+#    LISTWISE_SYSTEM = (
+#        "You are a pictogram reranker for an AAC communication system.\n"
+#        "Given a user query and a numbered list of pictogram descriptions, "
+#        "reorder them from most to least relevant for the query.\n"
+#        f"Output ONLY a JSON array of indices in your preferred order, e.g. [2, 0, 5, 1, ...].\n"
+#        "Include ALL indices exactly once. No explanation."
+#    )
+#
+#    results = {"strict": [], "relaxed": [], "strict_prec": [], "relaxed_prec": [], "strict_f1": [], "relaxed_f1": []}
+#    for gt_ids, candidate_id_sets, sentence, pool, _ in tqdm(rows_cache, desc=desc):
+#        shortlist = reranker(sentence, pool, top_n=ce_n)
+#        entries = [f"{i}: {pid_to_description.get(pid, f'pictogram {pid}')}"
+#                   for i, pid in enumerate(shortlist)]
+#        user_prompt = f"/no_think\nQuery: \"{sentence}\"\n\n" + "\n".join(entries)
+#
+#        try:
+#            if backend == "ollama":
+#                resp = _ollama.chat(
+#                    model=llm_model,
+#                    messages=[
+#                        {"role": "system", "content": LISTWISE_SYSTEM},
+#                        {"role": "user",   "content": user_prompt},
+#                    ],
+#                    think=False,
+#                )
+#                raw = resp.message.content.strip()
+#            else:
+#                raw = ""
+#
+#            raw = re.sub(r'<think>[\s\S]*?</think>\s*', '', raw).strip()
+#            raw = raw.replace('```json', '').replace('```', '').strip()
+#            order = _json.loads(raw)
+#            if isinstance(order, list) and len(order) > 0:
+#                valid = [i for i in order if isinstance(i, int) and 0 <= i < len(shortlist)]
+#                seen = set(valid)
+#                for i in range(len(shortlist)):
+#                    if i not in seen:
+#                        valid.append(i)
+#                ranked = [shortlist[i] for i in valid][:rerank_n]
+#            else:
+#                ranked = shortlist[:rerank_n]
+#        except Exception:
+#            ranked = shortlist[:rerank_n]
+#
+#        sm = strict_retrieval_metrics(gt_ids, ranked)
+#        rm = relaxed_retrieval_metrics(gt_ids, ranked, candidate_id_sets)
+#        results["strict"].append(sm["recall"])
+#        results["relaxed"].append(rm["recall"])
+#        results["strict_prec"].append(sm["precision"])
+#        results["relaxed_prec"].append(rm["precision"])
+#        results["strict_f1"].append(sm["f1"])
+#        results["relaxed_f1"].append(rm["f1"])
+#    return results
 
 
-def _run_llm_listwise_mode(rows_cache, reranker, rerank_n, pid_to_description, llm_model, backend, bridge, desc, ce_n=60):
-    """Cross-encoder shortlists ce_n candidates, LLM reorders and we keep top rerank_n.
-
-    ce_n > rerank_n means the LLM can surface items the CE ranked below rerank_n,
-    actually changing the returned set and improving recall — not just reordering.
-    One LLM call per sentence.
-    """
-    import json as _json
-    import ollama as _ollama
-
-    LISTWISE_SYSTEM = (
-        "You are a pictogram reranker for an AAC communication system.\n"
-        "Given a user query and a numbered list of pictogram descriptions, "
-        "reorder them from most to least relevant for the query.\n"
-        f"Output ONLY a JSON array of indices in your preferred order, e.g. [2, 0, 5, 1, ...].\n"
-        "Include ALL indices exactly once. No explanation."
-    )
-
-    results = {"strict": [], "relaxed": [], "strict_prec": [], "relaxed_prec": [], "strict_f1": [], "relaxed_f1": []}
-    for gt_ids, candidate_id_sets, sentence, pool, _ in tqdm(rows_cache, desc=desc):
-        shortlist = reranker(sentence, pool, top_n=ce_n)
-        entries = [f"{i}: {pid_to_description.get(pid, f'pictogram {pid}')}"
-                   for i, pid in enumerate(shortlist)]
-        user_prompt = f"/no_think\nQuery: \"{sentence}\"\n\n" + "\n".join(entries)
-
-        try:
-            if backend == "ollama":
-                resp = _ollama.chat(
-                    model=llm_model,
-                    messages=[
-                        {"role": "system", "content": LISTWISE_SYSTEM},
-                        {"role": "user",   "content": user_prompt},
-                    ],
-                    think=False,
-                )
-                raw = resp.message.content.strip()
-            else:
-                raw = ""
-
-            raw = re.sub(r'<think>[\s\S]*?</think>\s*', '', raw).strip()
-            raw = raw.replace('```json', '').replace('```', '').strip()
-            order = _json.loads(raw)
-            if isinstance(order, list) and len(order) > 0:
-                valid = [i for i in order if isinstance(i, int) and 0 <= i < len(shortlist)]
-                seen = set(valid)
-                for i in range(len(shortlist)):
-                    if i not in seen:
-                        valid.append(i)
-                ranked = [shortlist[i] for i in valid][:rerank_n]
-            else:
-                ranked = shortlist[:rerank_n]
-        except Exception:
-            ranked = shortlist[:rerank_n]
-
-        sm = strict_retrieval_metrics(gt_ids, ranked)
-        rm = relaxed_retrieval_metrics(gt_ids, ranked, candidate_id_sets)
-        results["strict"].append(sm["recall"])
-        results["relaxed"].append(rm["recall"])
-        results["strict_prec"].append(sm["precision"])
-        results["relaxed_prec"].append(rm["precision"])
-        results["strict_f1"].append(sm["f1"])
-        results["relaxed_f1"].append(rm["f1"])
-    return results
+#def _run_llm_rag_mode(rows_cache, reranker, pid_to_description, llm_model, backend, bridge, desc, ce_n=60):
+#    """RAG-style: CE shortlists ce_n candidates, LLM selects the relevant subset.
+#
+#    The LLM decides how many pictograms to return (variable size), not constrained
+#    to rerank_n. Evaluated with strict/relaxed recall on the LLM's selection.
+#    """
+#    import json as _json
+#    import ollama as _ollama
+#
+#    RAG_SYSTEM = (
+#        "You are an AAC pictogram selector. "
+#        "Given a sentence and a numbered list of pictogram descriptions, "
+#        "select ALL pictograms needed to visually communicate the sentence. "
+#        "AAC communication requires pictograms for EVERY concept: person, action, object, place, feeling, modifier. "
+#        "Select 5 to 10 pictograms. Err on the side of including more rather than fewer. "
+#        "Output ONLY a JSON array of indices, e.g. [2, 5, 11, 3, 8]. No explanation."
+#    )
+#
+#    results = {"strict": [], "relaxed": [], "strict_prec": [], "relaxed_prec": [], "strict_f1": [], "relaxed_f1": [], "n_selected": []}
+#    for gt_ids, candidate_id_sets, sentence, pool, _ in tqdm(rows_cache, desc=desc):
+#        shortlist = reranker(sentence, pool, top_n=ce_n)
+#        entries = [f"{i}: {pid_to_description.get(pid, str(pid))}"
+#                   for i, pid in enumerate(shortlist)]
+#        user_prompt = f"/no_think\nSentence: \"{sentence}\"\n\n" + "\n".join(entries)
+#
+#        selected = shortlist[:10]  # fallback
+#        try:
+#            if backend == "ollama":
+#                resp = _ollama.chat(
+#                    model=llm_model,
+#                    messages=[
+#                        {"role": "system", "content": RAG_SYSTEM},
+#                        {"role": "user",   "content": user_prompt},
+#                    ],
+#                    think=False,
+#                )
+#                raw = resp.message.content.strip()
+#            else:
+#                raw = "[]"
+#
+#            raw = re.sub(r'<think>[\s\S]*?</think>\s*', '', raw).strip()
+#            raw = raw.replace('```json', '').replace('```', '').strip()
+#            indices = _json.loads(raw)
+#            if isinstance(indices, list) and len(indices) > 0:
+#                valid = [i for i in indices if isinstance(i, int) and 0 <= i < len(shortlist)]
+#                selected = [shortlist[i] for i in valid]
+#        except Exception:
+#            pass
+#
+#        sm = strict_retrieval_metrics(gt_ids, selected)
+#        rm = relaxed_retrieval_metrics(gt_ids, selected, candidate_id_sets)
+#        tqdm.write(f"  [{sentence[:50]}] GT={len(gt_ids)} sel={len(selected)} R={rm['recall']:.2f} P={rm['precision']:.2f} F1={rm['f1']:.2f}")
+#        results["strict"].append(sm["recall"])
+#        results["relaxed"].append(rm["recall"])
+#        results["strict_prec"].append(sm["precision"])
+#        results["relaxed_prec"].append(rm["precision"])
+#        results["strict_f1"].append(sm["f1"])
+#        results["relaxed_f1"].append(rm["f1"])
+#        results["n_selected"].append(len(selected))
+#    return results
 
 
-def _run_llm_rag_mode(rows_cache, reranker, pid_to_description, llm_model, backend, bridge, desc, ce_n=60):
-    """RAG-style: CE shortlists ce_n candidates, LLM selects the relevant subset.
-
-    The LLM decides how many pictograms to return (variable size), not constrained
-    to rerank_n. Evaluated with strict/relaxed recall on the LLM's selection.
-    """
-    import json as _json
-    import ollama as _ollama
-
-    RAG_SYSTEM = (
-        "You are an AAC pictogram selector. "
-        "Given a sentence and a numbered list of pictogram descriptions, "
-        "select ALL pictograms needed to visually communicate the sentence. "
-        "AAC communication requires pictograms for EVERY concept: person, action, object, place, feeling, modifier. "
-        "Select 5 to 10 pictograms. Err on the side of including more rather than fewer. "
-        "Output ONLY a JSON array of indices, e.g. [2, 5, 11, 3, 8]. No explanation."
-    )
-
-    results = {"strict": [], "relaxed": [], "strict_prec": [], "relaxed_prec": [], "strict_f1": [], "relaxed_f1": [], "n_selected": []}
-    for gt_ids, candidate_id_sets, sentence, pool, _ in tqdm(rows_cache, desc=desc):
-        shortlist = reranker(sentence, pool, top_n=ce_n)
-        entries = [f"{i}: {pid_to_description.get(pid, str(pid))}"
-                   for i, pid in enumerate(shortlist)]
-        user_prompt = f"/no_think\nSentence: \"{sentence}\"\n\n" + "\n".join(entries)
-
-        selected = shortlist[:10]  # fallback
-        try:
-            if backend == "ollama":
-                resp = _ollama.chat(
-                    model=llm_model,
-                    messages=[
-                        {"role": "system", "content": RAG_SYSTEM},
-                        {"role": "user",   "content": user_prompt},
-                    ],
-                    think=False,
-                )
-                raw = resp.message.content.strip()
-            else:
-                raw = "[]"
-
-            raw = re.sub(r'<think>[\s\S]*?</think>\s*', '', raw).strip()
-            raw = raw.replace('```json', '').replace('```', '').strip()
-            indices = _json.loads(raw)
-            if isinstance(indices, list) and len(indices) > 0:
-                valid = [i for i in indices if isinstance(i, int) and 0 <= i < len(shortlist)]
-                selected = [shortlist[i] for i in valid]
-        except Exception:
-            pass
-
-        sm = strict_retrieval_metrics(gt_ids, selected)
-        rm = relaxed_retrieval_metrics(gt_ids, selected, candidate_id_sets)
-        tqdm.write(f"  [{sentence[:50]}] GT={len(gt_ids)} sel={len(selected)} R={rm['recall']:.2f} P={rm['precision']:.2f} F1={rm['f1']:.2f}")
-        results["strict"].append(sm["recall"])
-        results["relaxed"].append(rm["recall"])
-        results["strict_prec"].append(sm["precision"])
-        results["relaxed_prec"].append(rm["precision"])
-        results["strict_f1"].append(sm["f1"])
-        results["relaxed_f1"].append(rm["f1"])
-        results["n_selected"].append(len(selected))
-    return results
-
-
-def _run_llm_expand_mode(rows_cache, retrieve_fn, reranker, rerank_n, llm_model, backend, bridge, desc, concept_k=50):
-    """LLM concepts expand the retrieval pool; original sentence reranks the union.
-
-    Uses LLM concepts to retrieve additional candidates beyond the sentence pool,
-    then reranks the combined pool with the original sentence query. This separates
-    the LLM's role (diversifying candidates) from the reranker's role (scoring).
-    """
-    results = {"strict": [], "relaxed": []}
-    for gt_ids, candidate_id_sets, sentence, pool, _ in tqdm(rows_cache, desc=desc):
-        raw, _ = call_llm(sentence, model=llm_model, backend=backend, bridge=bridge)
-        llm_concepts = _parse_llm_list(raw) or []
-        tqdm.write(f"  [{sentence[:50]}] → {llm_concepts}")
-
-        seen = set(pool)
-        expanded = list(pool)
-        for concept in llm_concepts:
-            for pid in retrieve_fn(concept, top_k=concept_k):
-                if pid not in seen:
-                    expanded.append(pid)
-                    seen.add(pid)
-
-        ranked = reranker(sentence, expanded, top_n=rerank_n)
-        results["strict"].append(strict_retrieval_metrics(gt_ids, ranked)["recall"])
-        results["relaxed"].append(relaxed_retrieval_metrics(gt_ids, ranked, candidate_id_sets)["recall"])
-    return results
+#def _run_llm_expand_mode(rows_cache, retrieve_fn, reranker, rerank_n, llm_model, backend, bridge, desc, concept_k=50):
+#    """LLM concepts expand the retrieval pool; original sentence reranks the union.
+#
+#    Uses LLM concepts to retrieve additional candidates beyond the sentence pool,
+#    then reranks the combined pool with the original sentence query. This separates
+#    the LLM's role (diversifying candidates) from the reranker's role (scoring).
+#    """
+#    results = {"strict": [], "relaxed": []}
+#    for gt_ids, candidate_id_sets, sentence, pool, _ in tqdm(rows_cache, desc=desc):
+#        raw, _ = call_llm(sentence, model=llm_model, backend=backend, bridge=bridge)
+#        llm_concepts = _parse_llm_list(raw) or []
+#        tqdm.write(f"  [{sentence[:50]}] → {llm_concepts}")
+#
+#        seen = set(pool)
+#        expanded = list(pool)
+#        for concept in llm_concepts:
+#            for pid in retrieve_fn(concept, top_k=concept_k):
+#                if pid not in seen:
+#                    expanded.append(pid)
+#                    seen.add(pid)
+#
+#        ranked = reranker(sentence, expanded, top_n=rerank_n)
+#        results["strict"].append(strict_retrieval_metrics(gt_ids, ranked)["recall"])
+#        results["relaxed"].append(relaxed_retrieval_metrics(gt_ids, ranked, candidate_id_sets)["recall"])
+#    return results
 
 
 # Single source of truth for run-config labels, shared by print_retrieval_results
@@ -1157,7 +1164,7 @@ _MODE_LABELS = {
     "llm_simplify_retrieve":      "CE rerank (LLM polished)",
 }
 
-
+# prints a table for different formats of retrieval results 
 def print_retrieval_results(results, rerank_n, name=None, modes=None, show_baselines=True):
     def avg(lst): return sum(lst) / len(lst) if lst else None
     header = f"── {name} " if name else "── "
@@ -1191,9 +1198,10 @@ def print_retrieval_results(results, rerank_n, name=None, modes=None, show_basel
             continue
         print(f"{label}: {s:.3f}   {r:.3f}")
 
-VL_RERANK_PROMPT = "Retrieve images or text relevant to the user's query."
+# prompt for the VL reranker.
+VL_RERANK_PROMPT = "Retrieve AAC pictograms (image and description) that visually represent the concept in the user's query."
 
-
+# creates the possibility to score against two classes
 class QwenVLReranker:
     """Wraps Qwen3VLReranker (from the model's scripts/) to expose a .predict(pairs) interface.
 
@@ -1239,6 +1247,8 @@ class QwenVLReranker:
             scores.extend(self._model.process(inputs))
         return scores
 
+# rerank the documents using either a listwise or pointwise text reranker, 
+# returning scores aligned to the original document order.
 def _text_rerank_scores(text_reranker, query, docs, batch_size=64):
     """Score `docs` against `query`, aligned to the original `docs` order.
 
@@ -1270,7 +1280,7 @@ def _text_rerank_scores(text_reranker, query, docs, batch_size=64):
                 scores.append(0.0)
         return scores
 
-
+# rerank the pictograms using a text cross-encoder and/or a VL cross-encoder, combining their scores if both are provided.
 def rerank_pictograms(
     query: str,
     candidate_ids: list[int],
@@ -1357,7 +1367,7 @@ def rerank_pictograms(
     result.extend(unscored_ids)
     return result[:top_n]
 
-
+# plots the aggregated results of multiple runs with different configurations and modes, showing strict and relaxed recall with 95% confidence intervals.
 def _plot_run_configs(agg, t_crit, n_seeds):
     configs = agg['config'].unique().tolist()
     modes   = agg['mode'].unique().tolist()
@@ -1386,7 +1396,7 @@ def _plot_run_configs(agg, t_crit, n_seeds):
     plt.tight_layout()
     plt.show()
 
-
+# runs the retrieval and reranking experiments for multiple configurations and modes, optionally averaging over multiple random seeds, and optionally plotting the results.
 def run_configs(
     configs,
     df,
@@ -1416,8 +1426,6 @@ def run_configs(
 
     Returns: (runs_df, summary)
     """
-    from scipy.stats import t as t_dist
-
     if retrieve_fn is None:
         retrieve_fn = retrieve
     if reranker is None:
@@ -1431,24 +1439,21 @@ def run_configs(
     # tables and the aggregated summary table always agree on names.
     _mode_labels = _MODE_LABELS
 
-    import json as _json
-
     # ── checkpoint setup ─────────────────────────────────────────────────────
     def _ckpt_key(seed, cfg_name, mode):
         return f"{seed}__{cfg_name}__{mode}"
 
     _ckpt_done = {}
     if checkpoint_path:
-        import os as _os
-        if _os.path.exists(checkpoint_path):
+        if os.path.exists(checkpoint_path):
             with open(checkpoint_path) as _f:
-                _ckpt_done = _json.load(_f)
+                _ckpt_done = json.load(_f)
             print(f"Checkpoint loaded: {len(_ckpt_done)} entries done")
 
     def _ckpt_save():
         if checkpoint_path:
             with open(checkpoint_path, "w") as _f:
-                _json.dump(_ckpt_done, _f, indent=2)
+                json.dump(_ckpt_done, _f, indent=2)
 
     all_runs      = []
     all_sentences = []
@@ -1616,7 +1621,146 @@ def run_configs(
 
     return runs_df, summary
 
+# parses the checkpoint key into its components: seed, config name, and mode key. This is used to reconstruct the run configurations from the saved checkpoint JSON.
+def _parse_checkpoint_key(key):
+    """Split a run_configs() checkpoint key back into (seed, cfg_name, mode_key).
 
+    Keys are built by _ckpt_key as f"{seed}__{cfg_name}__{mode}" (see run_configs),
+    with cfg_name == "__baselines__" for the pool/sent/oracle baseline entry.
+    """
+    seed_str, rest = key.split("__", 1)
+    cfg_name, mode_key = rest.rsplit("__", 1)
+    return int(seed_str), cfg_name, mode_key
+
+# reconstructs run_configs()-style rows straight from a saved checkpoint JSON, without rerunning the pipeline. 
+# It parses the checkpoint keys and extracts the relevant metrics for each configuration and mode.
+def _load_pipeline_runs(checkpoint_path, pipeline_name=None):
+    """Reconstruct run_configs()-style (seed, config, mode, strict, relaxed) rows
+    straight from a saved checkpoint JSON, without rerunning the pipeline.
+
+    pipeline_name: label used as the 'config' column (i.e. the bar series) in the
+    combined comparison plot. Defaults to the filename with '_checkpoint...' stripped.
+    """
+    if pipeline_name is None:
+        stem = os.path.splitext(os.path.basename(checkpoint_path))[0]
+        pipeline_name = re.sub(r'_checkpoint.*$', '', stem)
+
+    with open(checkpoint_path) as f:
+        ckpt = json.load(f)
+
+    parsed = {key: _parse_checkpoint_key(key) for key in ckpt}
+    cfg_names = {cfg for _, cfg, _ in parsed.values() if cfg != "__baselines__"}
+    multi_cfg = len(cfg_names) > 1  # disambiguate modes if the file mixes several LLM configs
+
+    rows = []
+    for key, entry in ckpt.items():
+        seed, cfg_name, mode_key = parsed[key]
+
+        if cfg_name == "__baselines__":
+            base = entry["_raw"]
+            for sub_key in ("pool", "sent"):
+                d = base.get(sub_key, {})
+                s_vals, r_vals = d.get("strict", []), d.get("relaxed", [])
+                if not s_vals and not r_vals:
+                    continue
+                rows.append({
+                    "seed": seed, "config": pipeline_name,
+                    "mode": _MODE_LABELS.get(sub_key, sub_key),
+                    "strict":  float(np.mean(s_vals))  if s_vals else None,
+                    "relaxed": float(np.mean(r_vals))  if r_vals else None,
+                })
+            continue
+
+        mode_label = _MODE_LABELS.get(mode_key, mode_key)
+        if multi_cfg:
+            mode_label = f"{mode_label} [{cfg_name}]"
+        rows.append({
+            "seed": seed, "config": pipeline_name, "mode": mode_label,
+            "strict": entry.get("strict"), "relaxed": entry.get("relaxed"),
+        })
+
+        # the LLM-polished pool (pre-rerank) recall is stashed inside
+        # llm_simplify_retrieve's _raw — surface it as its own mode/row.
+        if mode_key == "llm_simplify_retrieve":
+            raw = entry.get("_raw", {})
+            s_vals, r_vals = raw.get("pool_strict", []), raw.get("pool_relaxed", [])
+            if s_vals or r_vals:
+                pool_label = _MODE_LABELS["llm_simplify_retrieve:pool"]
+                if multi_cfg:
+                    pool_label = f"{pool_label} [{cfg_name}]"
+                rows.append({
+                    "seed": seed, "config": pipeline_name, "mode": pool_label,
+                    "strict":  float(np.mean(s_vals))  if s_vals else None,
+                    "relaxed": float(np.mean(r_vals))  if r_vals else None,
+                })
+
+    return rows
+
+# plots a comparison histogram of multiple pipeline configurations, showing strict and relaxed 
+# recall with 95% confidence intervals. It merges several checkpoint JSONs into a single bar chart 
+# for easy comparison.
+def plot_pipeline_comparison(checkpoint_paths, show_baselines=True, plot=True):
+    """Merge several run_configs() checkpoint JSONs into a single comparison histogram.
+
+    Each checkpoint JSON (e.g. jina_image_marco_checkpoint_6.json, yuan_marco_checkpoint_2.json
+    in jsons/reranking/) represents one full pipeline (embedding model + reranker). This loads
+    them straight from disk -- no rerun needed -- and produces one bar chart with pipelines as
+    the grouped bar series and pipeline stage (pool / CE rerank / LLM rerank / ...) on the x-axis,
+    so all pipelines can be compared side by side.
+
+    checkpoint_paths: a directory of *.json checkpoints, a list of paths, or a
+    {pipeline_label: path} dict for custom labeling.
+    show_baselines: whether to include the pool/sent baseline rows.
+    plot: if True, show the combined bar chart (strict & relaxed recall, 95% CI across seeds).
+
+    Returns: (runs_df, summary)
+    """
+    if isinstance(checkpoint_paths, str):
+        items = [(None, p) for p in sorted(glob.glob(os.path.join(checkpoint_paths, "*.json")))]
+    elif isinstance(checkpoint_paths, dict):
+        items = list(checkpoint_paths.items())
+    else:
+        items = [(None, p) for p in checkpoint_paths]
+
+    all_rows = []
+    for pipeline_name, path in items:
+        all_rows.extend(_load_pipeline_runs(path, pipeline_name=pipeline_name))
+
+    runs_df = pd.DataFrame(all_rows)
+    if not show_baselines:
+        baseline_labels = {_MODE_LABELS["pool"], _MODE_LABELS["sent"]}
+        runs_df = runs_df[~runs_df["mode"].isin(baseline_labels)]
+
+    n_seeds = int(runs_df.groupby("config")["seed"].nunique().max())
+    t_crit  = t_dist.ppf(0.975, df=max(n_seeds - 1, 1))
+
+    def _ci95(mean, std):
+        if pd.isna(std) or n_seeds < 2:
+            return f"{mean:.3f}"
+        half = t_crit * std / np.sqrt(n_seeds)
+        return f"{mean:.3f} ± {half:.3f}"
+
+    agg = runs_df.groupby(["config", "mode"], sort=False).agg(
+        strict_mean=("strict",  "mean"), strict_std=("strict",  "std"),
+        relaxed_mean=("relaxed", "mean"), relaxed_std=("relaxed", "std"),
+    ).reset_index()
+
+    summary = pd.DataFrame({
+        "Pipeline":       agg["config"],
+        "Mode":           agg["mode"],
+        "Strict Recall":  agg.apply(lambda r: _ci95(r.strict_mean,  r.strict_std),  axis=1),
+        "Relaxed Recall": agg.apply(lambda r: _ci95(r.relaxed_mean, r.relaxed_std), axis=1),
+    })
+    print(f'\nPipeline comparison (mean ± 95% CI across up to {n_seeds} seed(s), t df={n_seeds - 1}):')
+    display(summary)
+
+    if plot:
+        _plot_run_configs(agg, t_crit, n_seeds)
+
+    return runs_df, summary
+
+# creates the server for running the web interface for pictogram retrieval and reranking, using FastAPI and Uvicorn.
+#  It sets up endpoints for retrieval and chat, mounts static files, and displays a clickable link to the web app.
 def create_pictogram_server(
     milvus_client,
     collection: str,
