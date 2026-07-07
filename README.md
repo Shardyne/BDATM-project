@@ -54,6 +54,7 @@ pip install "transformers>=4.57.0" "qwen-vl-utils>=0.0.14" pandas numpy matplotl
 You'll also need:
 - **Ollama** running locally, with `qwen3.5:4b` pulled (used for query simplification throughout retrieval and reranking).
 - A **Hugging Face token** with access to the two datasets above, set via an environment variable / secrets manager rather than hardcoded in the notebook.
+- A **ngrok token** is necessary to run the web app and the WebLLM in Colab; set it via an environment variable / secrets manager rather than hardcoded in the notebook.
 
 Run the notebook from the repository root (`BDATM-project/`) — all paths (e.g. `./BDATM/jsons/...`) are relative to that working directory.
 
