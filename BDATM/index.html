@@ -120,7 +120,7 @@ let pool        = new Map();   // id → symbol  retrieved but undecided
 let chatHistory = [];
 let engine      = null;
 let rankedQueue = [];           // pre-fetched symbols waiting to slide into pool
-const DISPLAY_SIZE = 20;        // symbols shown at a time
+const DISPLAY_SIZE = 30;        // symbols shown at a time
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const statusBar   = document.getElementById("status-bar");
@@ -180,7 +180,7 @@ async function llmChat(messages, modelOverride = null) {
 }
 
 // ── Retrieval ─────────────────────────────────────────────────────────────────
-async function retrieveSymbols(query, topK = 400, rerankN = 50) {
+async function retrieveSymbols(query, topK = 300, rerankN = 50) {
   const r = await fetch("/retrieve", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -222,7 +222,7 @@ async function handleQuery(userMessage) {
 
     setStatus("Retrieving…");
     rankedQueue = [];
-    const data = await retrieveSymbols(userMessage, 400, 50);
+    const data = await retrieveSymbols(userMessage, 300, 50);
     const symbols = data.symbols ?? [];
     // Show the server-side simplified rerank query (from llm_simplify_query)
     conceptsBar.innerHTML = `<span class="concept-chip">${data.rerank_query ?? ""}</span>`;

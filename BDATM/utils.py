@@ -1801,7 +1801,7 @@ def create_pictogram_server(
     class _RetrieveReq(BaseModel):
         query: str
         model: str = llm_model
-        top_k: int = 400
+        top_k: int = 300
         rerank_n: int = 50
 
     class _ChatReq(BaseModel):

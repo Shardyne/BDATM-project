@@ -20,3 +20,6 @@ milvus.db
 .DS_Store
 *.zip
 node_modules/
+
+# Claude Code local settings
+.claude/
